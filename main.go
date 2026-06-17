@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ type FilePayload struct {
 	NeedTranscode bool
 }
 
-// TgMediaItem 统一的 Telegram 媒体节点 JSON 映射结构体体
+// TgMediaItem 统一的 Telegram 媒体节点 JSON 映射结构体
 type TgMediaItem struct {
 	Type              string `json:"type"`
 	Media             string `json:"media"`
@@ -65,7 +66,7 @@ type TgMediaItem struct {
 }
 
 func main() {
-	// 【📢 混放参数自动识别器】：由于 Go 原生 flag 库在遇到第一个路径后会停止解析后面的参数，
+	// 【📢 混放参数自动识别器】：由于 Go 原生 flag 库在遇到第一个位置参数（路径）后会停止解析后面的参数，
 	// 我们在这里手动将位置参数（路径）剥离并一律追加到最后面，完美达成 GNU getopt 选项随意混放的效果。
 	var flagArgs []string
 	var positionalArgs []string
@@ -73,13 +74,12 @@ func main() {
 		arg := os.Args[i]
 		if strings.HasPrefix(arg, "-") {
 			flagArgs = append(flagArgs, arg)
-			// 如果当前 flag 属于需要传值的选项，且不是用 = 形式赋值的，则紧随其后的下一个元素必然是它的 Value
 			if !strings.Contains(arg, "=") {
 				flagName := strings.TrimLeft(arg, "-")
 				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" {
 					if i+1 < len(os.Args) {
 						flagArgs = append(flagArgs, os.Args[i+1])
-						i++ // 跳过下一个已被归类的 Value 元素
+						i++
 					}
 				}
 			}
@@ -87,7 +87,6 @@ func main() {
 			positionalArgs = append(positionalArgs, arg)
 		}
 	}
-	// 重新拼装 os.Args 欺骗 flag.Parse()
 	os.Args = append(append([]string{os.Args[0]}, flagArgs...), positionalArgs...)
 
 	// 1. 定义 Flags
@@ -106,7 +105,7 @@ func main() {
 	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
 
 	flag.IntVar(&batchSizeFlag, "n", 10, "Batch size per media group (max 10)")
-	flag.StringVar(&typeFilterFlag, "type", "all", "Filter media type: pic, video/vedio, all, or specific ext like m4v")
+	flag.StringVar(&typeFilterFlag, "type", "all", "Filter media type: pic, video, all, or specific ext like m4v")
 	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration in seconds between batch uploads")
 	flag.BoolVar(&transcodeFlag, "transcode", false, "Enable on-the-fly FFmpeg transcoding for non-standard videos")
 
@@ -154,7 +153,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. 解析目标路径获取文件列表
+	// 6. 解析目标路径获取文件列表（内部已包含人类直觉自然数字排序逻辑）
 	rawFiles, err := collectFiles(targetPath)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
@@ -237,7 +236,7 @@ func main() {
 				ext := strings.ToLower(filepath.Ext(file))
 				if contains(config.VideoExts, ext) {
 					_, _, _, _, _, _ = getVideoDataUnified(file, cacheDir, cacheForceFlag)
-					time.Sleep(600 * time.Millisecond) // 单文件间歇，极其安全
+					time.Sleep(600 * time.Millisecond)
 				}
 			}
 		}
@@ -444,6 +443,7 @@ func writeLog(logDir string, filename string, content string) {
 	_, _ = f.WriteString(content)
 }
 
+// loadConfig 智能防呆版：全自动修复前导点号大小写异常
 func loadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -466,7 +466,7 @@ func loadConfig(path string) (*Config, error) {
 		if len(parts) != 2 {
 			continue
 		}
-		key := strings.TrimSpace(parts[0])
+		key := strings.ToUpper(strings.TrimSpace(parts[0]))
 		val := strings.TrimSpace(parts[1])
 
 		switch key {
@@ -479,25 +479,40 @@ func loadConfig(path string) (*Config, error) {
 			cfg.TgAPIURL = val
 		case "PHOTO_EXTS":
 			exts := strings.Split(strings.ToLower(val), ",")
-			for i, e := range exts {
-				exts[i] = strings.TrimSpace(e)
+			var cleanExts []string
+			for _, e := range exts {
+				e = strings.TrimSpace(e)
+				if e != "" {
+					if !strings.HasPrefix(e, ".") {
+						e = "." + e
+					}
+					cleanExts = append(cleanExts, e)
+				}
 			}
-			if len(exts) > 0 && exts[0] != "" {
-				cfg.PhotoExts = exts
+			if len(cleanExts) > 0 {
+				cfg.PhotoExts = cleanExts
 			}
 		case "VIDEO_EXTS":
 			exts := strings.Split(strings.ToLower(val), ",")
-			for i, e := range exts {
-				exts[i] = strings.TrimSpace(e)
+			var cleanExts []string
+			for _, e := range exts {
+				e = strings.TrimSpace(e)
+				if e != "" {
+					if !strings.HasPrefix(e, ".") {
+						e = "." + e
+					}
+					cleanExts = append(cleanExts, e)
+				}
 			}
-			if len(exts) > 0 && exts[0] != "" {
-				cfg.VideoExts = exts
+			if len(cleanExts) > 0 {
+				cfg.VideoExts = cleanExts
 			}
 		}
 	}
 	return cfg, scanner.Err()
 }
 
+// collectFiles 内置人类直觉自然数字排序内核
 func collectFiles(targetPath string) ([]string, error) {
 	fi, err := os.Stat(targetPath)
 	if err != nil {
@@ -521,10 +536,19 @@ func collectFiles(targetPath string) ([]string, error) {
 		}
 		return nil
 	})
-	return files, err
+	if err != nil {
+		return nil, err
+	}
+
+	// 🚀 【关键修复】：应用自定义的高精自然数字排序算法，纠正 1, 100, 11 倒序问题
+	sort.Slice(files, func(i, j int) bool {
+		return isLessNatural(files[i], files[j])
+	})
+
+	return files, nil
 }
 
-// uploadMediaGroup 自适应流式控流版：结合 io.Pipe 和 FFmpeg 不落盘实时转码
+// uploadMediaGroup 自适应流式控流版：结合 io.Pipe 和 2核VPS极速降维转码管道
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool, transcodeFlag bool) {
 	var mediaJSONArray []TgMediaItem
 	var payloads []FilePayload
@@ -569,7 +593,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				Thumb:             thumbValue,
 			})
 
-			// 验证是否需要开启不落盘转码
 			vExt := strings.ToLower(filepath.Ext(file))
 			needTrans := transcodeFlag && (vExt == ".avi" || vExt == ".mpg" || vExt == ".mpeg" || vExt == ".wmv" || vExt == ".m4v" || vExt == ".flv")
 
@@ -615,7 +638,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 			for _, p := range payloads {
 				uploadFileName := filepath.Base(p.FilePath)
-				// 如果开启转码，强行将对外表单里的视频后缀重塑为 .mp4 欺骗客户端支持在线点播
 				if p.NeedTranscode {
 					uploadFileName = strings.TrimSuffix(uploadFileName, filepath.Ext(uploadFileName)) + ".mp4"
 				}
@@ -626,9 +648,11 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 
 				if p.NeedTranscode {
-					// 🚀 FFmpeg 实时动态无盘转码内核 (已修复 libx264 拼写拼写)
-					cmd := exec.Command("ffmpeg", "-y", "-i", p.FilePath,
-						"-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "main", "-level:v", "4.0",
+					// 🚀 2核CPU性能压榨转码引擎：指定 veryfast 预设、threads双核硬限、等比降维 720p
+					cmd := exec.Command("ffmpeg", "-y", "-threads", "2", "-i", p.FilePath,
+						"-c:v", "libx264", "-preset", "veryfast",
+						"-vf", "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'",
+						"-pix_fmt", "yuv420p", "-profile:v", "main", "-level:v", "4.0",
 						"-c:a", "aac", "-b:a", "128k", "-f", "mp4",
 						"-movflags", "frag_keyframe+empty_moov+default_base_moof", "pipe:1",
 					)
@@ -771,7 +795,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	_ = os.Remove(finalThumbPath)
 	_ = os.Remove(finalMetaPath)
 
-	// 【微操控流】：在引发云端 FUSE Range 读取前，前置睡眠防封防限制
 	time.Sleep(200 * time.Millisecond)
 
 	cmdProbe := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "default=noprint_wrappers=1", videoPath)
@@ -827,7 +850,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
 
-	// 严格执行 Telegram 的 320x320 缩略图极限硬限制
 	maxSize := 320
 	var newW, newHeight int
 	if srcW > srcH {
@@ -878,4 +900,39 @@ func contains(slice []string, val string) bool {
 		}
 	}
 	return false
+}
+
+// isLessNatural 核心算法：完美支持 1, 2, 17, 105 升序人类直觉重排
+func isLessNatural(a, b string) bool {
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if isDigit(a[i]) && isDigit(b[j]) {
+			startA := i
+			for i < len(a) && isDigit(a[i]) {
+				i++
+			}
+			numA, _ := strconv.ParseUint(a[startA:i], 10, 64)
+
+			startB := j
+			for j < len(b) && isDigit(b[j]) {
+				j++
+			}
+			numB, _ := strconv.ParseUint(b[startB:j], 10, 64)
+
+			if numA != numB {
+				return numA < numB
+			}
+		} else {
+			if a[i] != b[j] {
+				return a[i] < b[j]
+			}
+			i++
+			j++
+		}
+	}
+	return len(a) < len(b)
+}
+
+func isDigit(b byte) bool {
+	return b >= '0' && b <= '9'
 }
