@@ -134,6 +134,12 @@ func main() {
 		} else {
 			fmt.Printf("\n--- Preparing batch: %d to %d (Total: %d) ---\n", i+1, end, len(files))
 			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag)
+
+			// 战略冷却优化：每批次上传成功后，让代码主动强制休眠 4 秒，防止连续高压轰炸云端累积风控权重
+			if end < len(files) {
+				fmt.Println("🛋️ 批次发送完毕，主动进入 4 秒战略冷却，防止触发后续频控...")
+				time.Sleep(4 * time.Second)
+			}
 		}
 	}
 
@@ -262,7 +268,6 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 			itemType = "video"
 			attachKey = fmt.Sprintf("video%d", videoIdx)
 
-			// WebDAV 终极融合提取：一个统一的本地化缓存路由器
 			width, height, duration, thumbPath, isPortraitVideo, thumbErr := getVideoDataUnified(file, cacheDir, cacheForce)
 			thumbFormKey := fmt.Sprintf("thumb_video%d", videoIdx)
 			var thumbValue string
@@ -271,8 +276,6 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 				absThumbPath, _ := filepath.Abs(thumbPath)
 				thumbValue = fmt.Sprintf("attach://%s", thumbFormKey)
 				fileFormFields = append(fileFormFields, fmt.Sprintf("     -F \"%s=@%s\"", thumbFormKey, absThumbPath))
-			} else if thumbErr != nil {
-				fmt.Printf("[Debug Error] Unified process failed for %s: %v\n", filepath.Base(file), thumbErr)
 			}
 
 			if isPortraitVideo && width > height {
@@ -385,7 +388,7 @@ func loadConfig(path string) (*Config, error) {
 			cfg.BotAPI = val
 		case "TG_API_URL":
 			cfg.TgAPIURL = val
-		case "PHOTO_EXTs":
+		case "PHOTO_EXTS":
 			exts := strings.Split(strings.ToLower(val), ",")
 			for i, e := range exts {
 				exts[i] = strings.TrimSpace(e)
@@ -443,6 +446,7 @@ func contains(slice []string, val string) bool {
 	return false
 }
 
+// uploadMediaGroup 自适应智能抗频控版：内置自回归重试闭环，确保大批次丢包后不中断
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool) {
 	hasMedia := false
 	for _, file := range files {
@@ -504,7 +508,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 		if isVideo {
 			attachKey := fmt.Sprintf("video%d", videoIdx)
-			// WebDAV 优化调用：从强化的本地统一缓存路由器拿取数据
 			width, height, duration, thumbPath, isPortraitVideo, thumbErr := getVideoDataUnified(file, cacheDir, cacheForce)
 			var thumbValue string
 
@@ -554,87 +557,124 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 		}
 	}
 
-	pipeReader, pipeWriter := io.Pipe()
-	multipartWriter := multipart.NewWriter(pipeWriter)
-	contentType := multipartWriter.FormDataContentType()
+	// 核心抗频控逻辑：最长尝试 5 次自愈重试机制
+	maxRetries := 5
+	for retry := 0; retry < maxRetries; retry++ {
+		pipeReader, pipeWriter := io.Pipe()
+		multipartWriter := multipart.NewWriter(pipeWriter)
+		contentType := multipartWriter.FormDataContentType()
 
-	go func() {
-		defer pipeWriter.Close()
-		defer multipartWriter.Close()
+		go func() {
+			defer pipeWriter.Close()
+			defer multipartWriter.Close()
 
-		_ = multipartWriter.WriteField("chat_id", strconv.FormatInt(chatID, 10))
-		mediaJSONBytes, _ := json.Marshal(mediaJSONArray)
-		_ = multipartWriter.WriteField("media", string(mediaJSONBytes))
+			_ = multipartWriter.WriteField("chat_id", strconv.FormatInt(chatID, 10))
+			mediaJSONBytes, _ := json.Marshal(mediaJSONArray)
+			_ = multipartWriter.WriteField("media", string(mediaJSONBytes))
 
-		for _, p := range payloads {
-			part, err := multipartWriter.CreateFormFile(p.FieldKey, filepath.Base(p.FilePath))
-			if err != nil {
-				return
+			for _, p := range payloads {
+				part, err := multipartWriter.CreateFormFile(p.FieldKey, filepath.Base(p.FilePath))
+				if err != nil {
+					return
+				}
+				file, err := os.Open(p.FilePath)
+				if err != nil {
+					return
+				}
+
+				if p.ShowProgress {
+					fi, _ := file.Stat()
+					descStr := filepath.Base(p.FilePath)
+					if retry > 0 {
+						descStr = fmt.Sprintf("[重试-%d] %s", retry, descStr)
+					}
+					bar := progressbar.NewOptions64(
+						fi.Size(),
+						progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", descStr)),
+						progressbar.OptionSetWriter(os.Stderr),
+						progressbar.OptionShowBytes(true),
+						progressbar.OptionSetWidth(15),
+						progressbar.OptionThrottle(65),
+						progressbar.OptionShowCount(),
+						progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
+						progressbar.OptionSpinnerType(14),
+						progressbar.OptionFullWidth(),
+					)
+					proxyReader := progressbar.NewReader(file, bar)
+					_, _ = io.Copy(part, &proxyReader)
+				} else {
+					_, _ = io.Copy(part, file)
+				}
+				file.Close()
 			}
-			file, err := os.Open(p.FilePath)
-			if err != nil {
-				return
-			}
+		}()
 
-			if p.ShowProgress {
-				fi, _ := file.Stat()
-				bar := progressbar.NewOptions64(
-					fi.Size(),
-					progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", filepath.Base(p.FilePath))),
-					progressbar.OptionSetWriter(os.Stderr),
-					progressbar.OptionShowBytes(true),
-					progressbar.OptionSetWidth(15),
-					progressbar.OptionThrottle(65),
-					progressbar.OptionShowCount(),
-					progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
-					progressbar.OptionSpinnerType(14),
-					progressbar.OptionFullWidth(),
-				)
-				proxyReader := progressbar.NewReader(file, bar)
-				_, _ = io.Copy(part, &proxyReader)
-			} else {
-				_, _ = io.Copy(part, file)
-			}
-			file.Close()
+		apiURL := fmt.Sprintf("%s/bot%s/sendMediaGroup", cfg.TgAPIURL, cfg.BotAPI)
+		req, err := http.NewRequest("POST", apiURL, pipeReader)
+		if err != nil {
+			fmt.Printf("Failed to create request: %v\n", err)
+			return
 		}
-	}()
+		req.Header.Set("Content-Type", contentType)
 
-	apiURL := fmt.Sprintf("%s/bot%s/sendMediaGroup", cfg.TgAPIURL, cfg.BotAPI)
-	req, err := http.NewRequest("POST", apiURL, pipeReader)
-	if err != nil {
-		fmt.Printf("Failed to create request: %v\n", err)
+		client := &http.Client{Timeout: 0}
+		resp, err := client.Do(req)
+
+		currentTimeStr := time.Now().Format("2006-01-02 15:04:05")
+		fileListStr := strings.Join(validFiles, ", ")
+
+		if err != nil {
+			errLogContent := fmt.Sprintf("[%s] ERROR: %v | Files attempted: [%s]\n", currentTimeStr, err, fileListStr)
+			writeLog(logDir, "error.log", errLogContent)
+			fmt.Printf("Upload request failed: %v\n", err)
+			return
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			fmt.Println("Batch upload success.")
+			okLogContent := fmt.Sprintf("[%s] SUCCESS: Status: %d | Files uploaded: [%s]\n", currentTimeStr, resp.StatusCode, fileListStr)
+			writeLog(logDir, "ok.log", okLogContent)
+			return // 👈 成功上传，顺利跳出重试闭环
+		}
+
+		// 💥 进入高亮错误分支审计
+		bodyStr := string(respBody)
+		if strings.Contains(bodyStr, "Too Many Requests") || strings.Contains(bodyStr, "retry after") {
+			// 自动提取要求等待的秒数，默认保底为 10 秒
+			waitSeconds := 10
+			if idx := strings.Index(bodyStr, "retry after "); idx != -1 {
+				sub := bodyStr[idx+len("retry after "):]
+				endIdx := 0
+				for endIdx < len(sub) && sub[endIdx] >= '0' && sub[endIdx] <= '9' {
+					endIdx++
+				}
+				if endIdx > 0 {
+					if s, err := strconv.Atoi(sub[:endIdx]); err == nil {
+						waitSeconds = s
+					}
+				}
+			}
+
+			// 频控自我苏醒疗法：自动睡眠指定时间 + 2秒额外冗余缓冲
+			fmt.Printf("\n⚠️ 触发 Telegram 官方频控限制。服务器返回: %s\n", bodyStr)
+			fmt.Printf("💤 脚本将自动高精度休眠 %d 秒后，原地重构并自动重试当前批次 (%d/%d)...\n\n", waitSeconds+2, retry+1, maxRetries)
+			time.Sleep(time.Duration(waitSeconds+2) * time.Second)
+			continue // 👈 回归头部，重建 io.Pipe 完美启动重试
+		}
+
+		// 其他非频控的不可抗力 API 错误（如 ChatNotFound 等），直接写日志并结束
+		fmt.Printf("\nTelegram API Error: Status %d, Body: %s\n", resp.StatusCode, bodyStr)
+		errLogContent := fmt.Sprintf("[%s] ERROR: Status %d | Body: %s | Files attempted: [%s]\n", currentTimeStr, resp.StatusCode, bodyStr, fileListStr)
+		writeLog(logDir, "error.log", errLogContent)
 		return
 	}
-	req.Header.Set("Content-Type", contentType)
 
-	client := &http.Client{Timeout: 0}
-	resp, err := client.Do(req)
-
-	currentTimeStr := time.Now().Format("2006-01-02 15:04:05")
-	fileListStr := strings.Join(validFiles, ", ")
-
-	if err != nil {
-		errLogContent := fmt.Sprintf("[%s] ERROR: %v | Files attempted: [%s]\n", currentTimeStr, err, fileListStr)
-		writeLog(logDir, "error.log", errLogContent)
-		fmt.Printf("Upload request failed: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusOK {
-		fmt.Println("Batch upload success.")
-		okLogContent := fmt.Sprintf("[%s] SUCCESS: Status: %d | Files uploaded: [%s]\n", currentTimeStr, resp.StatusCode, fileListStr)
-		writeLog(logDir, "ok.log", okLogContent)
-	} else {
-		fmt.Printf("\nTelegram API Error: Status %d, Body: %s\n", resp.StatusCode, string(respBody))
-		errLogContent := fmt.Sprintf("[%s] ERROR: Status %d | Body: %s | Files attempted: [%s]\n", currentTimeStr, resp.StatusCode, string(respBody), fileListStr)
-		writeLog(logDir, "error.log", errLogContent)
-	}
+	fmt.Println("\n❌ 当前批次已连续重试失败达到上限，放弃该批次。")
 }
 
-// getVideoDataUnified WebDAV 环境终极加速路由器：统一合并本地化缓存层
-// 命中缓存时，不仅直接返回本地 JPG，还将完全【跳过】ffprobe 云端网络调用，达成毫秒级零延迟。
 func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w, h, duration int, thumbPath string, isPortrait bool, err error) {
 	hasherName := sha1.New()
 	hasherName.Write([]byte(videoPath))
@@ -646,14 +686,12 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	isCacheValid := false
 	var cachedMeta VideoMetaCache
 
-	// 1. 如果没有开启强制刷新，优先审计本地多媒体强缓存
 	if !cacheForce {
 		_, errThumb := os.Stat(finalThumbPath)
 		metaBytes, errMeta := os.ReadFile(finalMetaPath)
 
 		if errThumb == nil && errMeta == nil {
 			if json.Unmarshal(metaBytes, &cachedMeta) == nil {
-				// 深度核验缓存合法性，确保尺寸完全契合 TG 知识库 320px 的硬限制
 				tW, tH := getImageDimensions(finalThumbPath)
 				if tW > 0 && tH > 0 && tW <= 320 && tH <= 320 {
 					isCacheValid = true
@@ -662,16 +700,13 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 		}
 	}
 
-	// 2. 缓存命中：直接返回，对 WebDAV 达到 0 字节网络消耗
 	if isCacheValid {
 		return cachedMeta.Width, cachedMeta.Height, cachedMeta.Duration, finalThumbPath, cachedMeta.IsPortrait, nil
 	}
 
-	// 3. 缓存失效：强制执行物理洗盘重构
 	_ = os.Remove(finalThumbPath)
 	_ = os.Remove(finalMetaPath)
 
-	// A. 发起云端 ffprobe 获取基础像素参数
 	cmdProbe := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "default=noprint_wrappers=1", videoPath)
 	outProbe, err := cmdProbe.Output()
 	if err != nil {
@@ -698,7 +733,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 		}
 	}
 
-	// B. 发起极简云端单帧抽帧（锁定第1秒，规避大范围随机寻道崩溃）
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
 	cmdImg := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", rawTempJpg)
@@ -710,7 +744,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	}
 	defer os.Remove(rawTempJpg)
 
-	// C. 收回到本地内存处理 320px 等比缩放与横竖判定
 	rawFile, err := os.Open(rawTempJpg)
 	if err != nil {
 		return 0, 0, 0, "", false, err
@@ -761,7 +794,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 		isPortrait = true
 	}
 
-	// D. 存储元数据到本地本地本地本地 JSON，完成双重闭环缓存
 	newCacheData := VideoMetaCache{
 		Width:      w,
 		Height:     h,
