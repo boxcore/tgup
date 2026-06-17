@@ -751,9 +751,17 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 					}
 				}
 			}
+
+			// 🚀 【精准优化点】：引入渐进式退避算法
+			// 机制：官方要求秒数 + 5秒基础缓冲 + (当前重试轮次 * 15秒延迟叠加)
+			// 第一轮重试：等 8 + 5 + 0 = 13秒
+			// 第二轮重试：等 8 + 5 + 15 = 28秒（让云端滑动窗口彻底冷却）
+			actualWait := waitSeconds + 5 + (retry * 15)
+
 			fmt.Printf("\n⚠️ 触发 Telegram 官方频控。服务器返回: %s\n", bodyStr)
-			fmt.Printf("💤 脚本将自动高精度休眠 %d 秒后，自动重试当前批次 (%d/%d)...\n\n", waitSeconds+2, retry+1, maxRetries)
-			time.Sleep(time.Duration(waitSeconds+2) * time.Second)
+			fmt.Printf("💤 为彻底清空云端权重，当前第 %d 次重试将主动高精度休眠 %d 秒...\n\n", retry+1, actualWait)
+
+			time.Sleep(time.Duration(actualWait) * time.Second)
 			continue
 		}
 
