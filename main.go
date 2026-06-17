@@ -45,9 +45,14 @@ type VideoMetaCache struct {
 }
 
 func main() {
+	// 1. 定义 Flags
 	var titleFlag string
 	var testFlag string
 	var cacheForceFlag bool
+
+	var batchSizeFlag int
+	var typeFilterFlag string
+	var sleepDurationFlag int
 
 	flag.StringVar(&titleFlag, "title", "", "Specify a global caption title for the media group")
 	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command")
@@ -55,21 +60,38 @@ func main() {
 	flag.BoolVar(&cacheForceFlag, "cache-force", false, "Force regenerate and overwrite existing thumbnails/photos")
 	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
 
+	flag.IntVar(&batchSizeFlag, "n", 10, "Batch size per media group (max 10)")
+	flag.StringVar(&typeFilterFlag, "type", "all", "Filter media type: pic (photos only), video/vedio (videos only), all (mix)")
+	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration in seconds between batch uploads")
+
+	// 2. 官方标准解析
 	flag.Parse()
 
+	// 3. 获取剩余的位置参数（路径）
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
-		fmt.Println("Usage: go run main.go [-t=curl] [--cache-force] [--title='title'] <path>")
+		fmt.Println("Usage: go run main.go [-n=10] [-type=video] [-s=5] <path>")
 		os.Exit(1)
 	}
 	targetPath := tailArgs[0]
 
+	// 4. 统一别名状态与规范防呆
 	finalTestMode := testFlag
 	if finalTestMode == "" {
 		finalTestMode = flag.Lookup("test").Value.String()
 	}
 
+	if batchSizeFlag > 10 {
+		batchSizeFlag = 10
+	} else if batchSizeFlag <= 0 {
+		batchSizeFlag = 10
+	}
+	if sleepDurationFlag < 0 {
+		sleepDurationFlag = 0
+	}
+
+	// 5. 初始化环境与加载配置
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("Error getting home directory: %v\n", err)
@@ -89,20 +111,43 @@ func main() {
 		os.Exit(1)
 	}
 
-	files, err := collectFiles(targetPath)
+	// 6. 解析目标路径获取文件列表
+	rawFiles, err := collectFiles(targetPath)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 7. 根据 -type 参数过滤文件列表
+	var files []string
+	typeFilterFlag = strings.ToLower(typeFilterFlag)
+	for _, file := range rawFiles {
+		ext := strings.ToLower(filepath.Ext(file))
+		isPhoto := contains(config.PhotoExts, ext)
+		isVideo := contains(config.VideoExts, ext)
+
+		if typeFilterFlag == "pic" && !isPhoto {
+			continue
+		}
+		if (typeFilterFlag == "video" || typeFilterFlag == "vedio") && !isVideo {
+			continue
+		}
+		if !isPhoto && !isVideo {
+			continue
+		}
+		files = append(files, file)
+	}
+
 	if len(files) == 0 {
-		fmt.Println("No valid files found to upload.")
+		fmt.Println("No valid files found matching the specific type criteria.")
 		return
 	}
 
 	if finalTestMode != "curl" {
-		fmt.Printf("Found %d file(s) to upload.\n", len(files))
+		fmt.Printf("Found %d file(s) to process after filtering.\n", len(files))
 	}
 
+	// 8. 决定全局标题
 	globalCaption := strings.TrimSpace(titleFlag)
 	if globalCaption == "" && finalTestMode != "curl" {
 		reader := bufio.NewReader(os.Stdin)
@@ -121,13 +166,25 @@ func main() {
 		bot.Debug = false
 	}
 
-	const batchSize = 10
-	for i := 0; i < len(files); i += batchSize {
-		end := i + batchSize
+	// 9. 动态分批处理
+	for i := 0; i < len(files); i += batchSizeFlag {
+		end := i + batchSizeFlag
 		if end > len(files) {
 			end = len(files)
 		}
 		batch := files[i:end]
+
+		// 批次级单线程有序预处理，每完成一个强制休眠，绝不轰炸网盘
+		if finalTestMode != "curl" {
+			fmt.Printf("⚡ 正在有序预处理当前批次 (%d/%d) 的 WebDAV 缓存...\n", i+1, end)
+			for _, file := range batch {
+				ext := strings.ToLower(filepath.Ext(file))
+				if contains(config.VideoExts, ext) {
+					_, _, _, _, _, _ = getVideoDataUnified(file, cacheDir, cacheForceFlag)
+					time.Sleep(600 * time.Millisecond)
+				}
+			}
+		}
 
 		if finalTestMode == "curl" {
 			generateCurlCommand(config, batch, globalCaption, cacheDir, cacheForceFlag)
@@ -135,10 +192,10 @@ func main() {
 			fmt.Printf("\n--- Preparing batch: %d to %d (Total: %d) ---\n", i+1, end, len(files))
 			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag)
 
-			// 战略冷却优化：每批次上传成功后，让代码主动强制休眠 4 秒，防止连续高压轰炸云端累积风控权重
-			if end < len(files) {
-				fmt.Println("🛋️ 批次发送完毕，主动进入 4 秒战略冷却，防止触发后续频控...")
-				time.Sleep(4 * time.Second)
+			// 批次间物理隔离冷却
+			if end < len(files) && sleepDurationFlag > 0 {
+				fmt.Printf("🛋️ 批次发送完毕，主动进入 %d 秒战略冷却...\n", sleepDurationFlag)
+				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
 		}
 	}
@@ -221,15 +278,6 @@ func getImageDimensions(path string) (int, int) {
 }
 
 func generateCurlCommand(cfg *Config, files []string, globalCaption string, cacheDir string, cacheForce bool) {
-	hasMedia := false
-	for _, file := range files {
-		ext := strings.ToLower(filepath.Ext(file))
-		if contains(cfg.PhotoExts, ext) || contains(cfg.VideoExts, ext) {
-			hasMedia = true
-			break
-		}
-	}
-
 	type TgMediaItem struct {
 		Type              string `json:"type"`
 		Media             string `json:"media"`
@@ -251,10 +299,6 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 		ext := strings.ToLower(filepath.Ext(file))
 		isPhoto := contains(cfg.PhotoExts, ext)
 		isVideo := contains(cfg.VideoExts, ext)
-
-		if hasMedia && !isVideo && !isPhoto {
-			continue
-		}
 
 		currentCaption := ""
 		if isFirstItem && globalCaption != "" {
@@ -435,44 +479,7 @@ func collectFiles(targetPath string) ([]string, error) {
 	return files, err
 }
 
-func contains(slice []string, val string) bool {
-	for _, item := range slice {
-		itemLower := strings.ToLower(item)
-		valLower := strings.ToLower(val)
-		if itemLower == valLower {
-			return true
-		}
-	}
-	return false
-}
-
-// uploadMediaGroup 自适应智能抗频控版：内置自回归重试闭环，确保大批次丢包后不中断
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool) {
-	hasMedia := false
-	for _, file := range files {
-		ext := strings.ToLower(filepath.Ext(file))
-		if contains(cfg.PhotoExts, ext) || contains(cfg.VideoExts, ext) {
-			hasMedia = true
-			break
-		}
-	}
-
-	var validFiles []string
-	for _, file := range files {
-		ext := strings.ToLower(filepath.Ext(file))
-		isPhoto := contains(cfg.PhotoExts, ext)
-		isVideo := contains(cfg.VideoExts, ext)
-		if hasMedia && !isVideo && !isPhoto {
-			fmt.Printf("[Skipped] %s (Cannot mix general Document with Photo/Video in an album)\n", filepath.Base(file))
-			continue
-		}
-		validFiles = append(validFiles, file)
-	}
-
-	if len(validFiles) == 0 {
-		return
-	}
-
 	type FilePayload struct {
 		FieldKey     string
 		FilePath     string
@@ -495,7 +502,7 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 	isFirstItem := true
 	photoIdx, videoIdx, docIdx := 1, 1, 1
 
-	for _, file := range validFiles {
+	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
 		isPhoto := contains(cfg.PhotoExts, ext)
 		isVideo := contains(cfg.VideoExts, ext)
@@ -508,10 +515,10 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 		if isVideo {
 			attachKey := fmt.Sprintf("video%d", videoIdx)
-			width, height, duration, thumbPath, isPortraitVideo, thumbErr := getVideoDataUnified(file, cacheDir, cacheForce)
+			width, height, duration, thumbPath, isPortraitVideo, _ := getVideoDataUnified(file, cacheDir, cacheForce)
 			var thumbValue string
 
-			if thumbErr == nil && thumbPath != "" {
+			if thumbPath != "" {
 				thumbFormKey := fmt.Sprintf("thumb_video%d", videoIdx)
 				thumbValue = fmt.Sprintf("attach://%s", thumbFormKey)
 				payloads = append(payloads, FilePayload{FieldKey: thumbFormKey, FilePath: thumbPath, ShowProgress: false})
@@ -557,7 +564,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 		}
 	}
 
-	// 核心抗频控逻辑：最长尝试 5 次自愈重试机制
 	maxRetries := 5
 	for retry := 0; retry < maxRetries; retry++ {
 		pipeReader, pipeWriter := io.Pipe()
@@ -621,7 +627,7 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 		resp, err := client.Do(req)
 
 		currentTimeStr := time.Now().Format("2006-01-02 15:04:05")
-		fileListStr := strings.Join(validFiles, ", ")
+		fileListStr := strings.Join(files, ", ")
 
 		if err != nil {
 			errLogContent := fmt.Sprintf("[%s] ERROR: %v | Files attempted: [%s]\n", currentTimeStr, err, fileListStr)
@@ -637,13 +643,11 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 			fmt.Println("Batch upload success.")
 			okLogContent := fmt.Sprintf("[%s] SUCCESS: Status: %d | Files uploaded: [%s]\n", currentTimeStr, resp.StatusCode, fileListStr)
 			writeLog(logDir, "ok.log", okLogContent)
-			return // 👈 成功上传，顺利跳出重试闭环
+			return
 		}
 
-		// 💥 进入高亮错误分支审计
 		bodyStr := string(respBody)
 		if strings.Contains(bodyStr, "Too Many Requests") || strings.Contains(bodyStr, "retry after") {
-			// 自动提取要求等待的秒数，默认保底为 10 秒
 			waitSeconds := 10
 			if idx := strings.Index(bodyStr, "retry after "); idx != -1 {
 				sub := bodyStr[idx+len("retry after "):]
@@ -658,14 +662,12 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 			}
 
-			// 频控自我苏醒疗法：自动睡眠指定时间 + 2秒额外冗余缓冲
 			fmt.Printf("\n⚠️ 触发 Telegram 官方频控限制。服务器返回: %s\n", bodyStr)
 			fmt.Printf("💤 脚本将自动高精度休眠 %d 秒后，原地重构并自动重试当前批次 (%d/%d)...\n\n", waitSeconds+2, retry+1, maxRetries)
 			time.Sleep(time.Duration(waitSeconds+2) * time.Second)
-			continue // 👈 回归头部，重建 io.Pipe 完美启动重试
+			continue
 		}
 
-		// 其他非频控的不可抗力 API 错误（如 ChatNotFound 等），直接写日志并结束
 		fmt.Printf("\nTelegram API Error: Status %d, Body: %s\n", resp.StatusCode, bodyStr)
 		errLogContent := fmt.Sprintf("[%s] ERROR: Status %d | Body: %s | Files attempted: [%s]\n", currentTimeStr, resp.StatusCode, bodyStr, fileListStr)
 		writeLog(logDir, "error.log", errLogContent)
@@ -707,6 +709,9 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	_ = os.Remove(finalThumbPath)
 	_ = os.Remove(finalMetaPath)
 
+	// 【微操控流点 1】：避免瞬间密集请求，前置强制微休眠
+	time.Sleep(200 * time.Millisecond)
+
 	cmdProbe := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "default=noprint_wrappers=1", videoPath)
 	outProbe, err := cmdProbe.Output()
 	if err != nil {
@@ -732,6 +737,9 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 			duration, _ = strconv.Atoi(val)
 		}
 	}
+
+	// 【微操控流点 2】：音视频流分离探测微歇
+	time.Sleep(400 * time.Millisecond)
 
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
@@ -804,4 +812,14 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	_ = os.WriteFile(finalMetaPath, metaBytes, 0644)
 
 	return w, h, duration, finalThumbPath, isPortrait, nil
+}
+
+// contains 扩展名匹配切片辅助函数
+func contains(slice []string, val string) bool {
+	for _, item := range slice {
+		if strings.EqualFold(item, val) {
+			return true
+		}
+	}
+	return false
 }
