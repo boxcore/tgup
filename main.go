@@ -44,14 +44,11 @@ func main() {
 	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command")
 	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command")
 
-	// 规范化布尔开关：--cache-force 或快捷缩写 -cf
 	flag.BoolVar(&cacheForceFlag, "cache-force", false, "Force regenerate and overwrite existing thumbnails/photos")
 	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
 
-	// 2. 官方标准解析
 	flag.Parse()
 
-	// 3. 获取剩余的位置参数（路径）
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
@@ -60,13 +57,11 @@ func main() {
 	}
 	targetPath := tailArgs[0]
 
-	// 4. 统一别名状态
 	finalTestMode := testFlag
 	if finalTestMode == "" {
 		finalTestMode = flag.Lookup("test").Value.String()
 	}
 
-	// 5. 初始化环境与加载配置
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("Error getting home directory: %v\n", err)
@@ -86,7 +81,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. 解析目标路径获取文件列表
 	files, err := collectFiles(targetPath)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
@@ -101,7 +95,6 @@ func main() {
 		fmt.Printf("Found %d file(s) to upload.\n", len(files))
 	}
 
-	// 7. 决定全局标题
 	globalCaption := strings.TrimSpace(titleFlag)
 	if globalCaption == "" && finalTestMode != "curl" {
 		reader := bufio.NewReader(os.Stdin)
@@ -110,7 +103,6 @@ func main() {
 		globalCaption = strings.TrimSpace(input)
 	}
 
-	// 8. 初始化 Telegram Bot
 	var bot *tgbotapi.BotAPI
 	if finalTestMode != "curl" {
 		bot, err = tgbotapi.NewBotAPIWithAPIEndpoint(config.BotAPI, config.TgAPIURL+"/bot%s/%s")
@@ -121,7 +113,6 @@ func main() {
 		bot.Debug = false
 	}
 
-	// 9. 分批处理
 	const batchSize = 10
 	for i := 0; i < len(files); i += batchSize {
 		end := i + batchSize
@@ -282,6 +273,7 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 				fmt.Printf("[Debug Error] Thumbnail generation failed for %s: %v\n", filepath.Base(file), thumbErr)
 			}
 
+			// 如果图片判定是竖屏，强行对调从视频读取的宽和高
 			if isPortraitVideo && width > height {
 				width, height = height, width
 			}
@@ -339,7 +331,7 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 
 	apiURL := fmt.Sprintf("%s/bot%s/sendMediaGroup", cfg.TgAPIURL, cfg.BotAPI)
 
-	fmt.Println("\n--- Generated Test CURL Command (With 20M Image Optimizer) ---")
+	fmt.Println("\n--- Generated Test CURL Command (With Image Optimizer) ---")
 	fmt.Printf("curl -X POST \"%s\" \\\n", apiURL)
 	fmt.Printf("     -F \"chat_id=%d\" \\\n", cfg.ChatID)
 	escapedMediaJSON := strings.ReplaceAll(mediaJSONStr, `"`, `\"`)
@@ -366,7 +358,6 @@ func loadConfig(path string) (*Config, error) {
 	}
 	defer file.Close()
 
-	// 原生支持白名单加入 .m4v
 	cfg := &Config{
 		PhotoExts: []string{".jpg", ".jpeg", ".png"},
 		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
@@ -643,7 +634,7 @@ func getVideoMeta(videoPath string) (width int, height int, duration int, err er
 	return width, height, duration, nil
 }
 
-// generateThumbnail 降维打击版：FFmpeg 负责抽取物理旋转对齐的原帧，Go 负责在内存进行 480px 偶数限边等比缩放
+// generateThumbnail 完美贴合 Telegram 标准：长边不超过 320px、高品质 JPG、移除会引发 234 错误的无效参数
 func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path string, isPortrait bool, err error) {
 	hasherName := sha1.New()
 	hasherName.Write([]byte(videoPath))
@@ -656,7 +647,8 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 		if fi, err := os.Stat(finalThumbPath); err == nil {
 			if fi.Size() > 10 {
 				tW, tH := getImageDimensions(finalThumbPath)
-				if tW > 0 && tH > 0 && tW <= 480 && tH <= 480 {
+				// 根据最新知识库限制：严格约束缓存图片的宽高均不得超过 320
+				if tW > 0 && tH > 0 && tW <= 320 && tH <= 320 {
 					isCacheValid = true
 					if tH > tW {
 						isPortrait = true
@@ -675,17 +667,19 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
 
-	// 只让 FFmpeg 摆正旋转并抽取第 1 秒的单帧原图，绝不再带多余表达式滤镜
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vf", "autorotate=1", "-vframes", "1", "-q:v", "2", rawTempJpg)
+	// 【致命错误修复区】：彻底抛弃 `-vf autorotate=1` 等破坏命令行的参数！
+	// 新版 FFmpeg 原生默认携带画面自动旋转解码。这里只用最纯净的命令在第 1 秒抽取单帧，保证稳定输出0退出码。
+	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", rawTempJpg)
 	if err := cmd.Run(); err != nil {
-		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vf", "autorotate=1", "-vframes", "1", "-q:v", "2", rawTempJpg)
+		// 备用降级方案，应对小于 1 秒的超短视频
+		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
 		if errFallback := cmdFallback.Run(); errFallback != nil {
 			return "", false, fmt.Errorf("ffmpeg raw frame extraction failed: %v", errFallback)
 		}
 	}
 	defer os.Remove(rawTempJpg)
 
-	// 解码真正立起来的、画面无黑帧的图像数据
+	// 使用 Go 原生图片库安全无损缩放，长边严格锁定为最高 320px
 	rawFile, err := os.Open(rawTempJpg)
 	if err != nil {
 		return "", false, err
@@ -701,8 +695,8 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
 
-	// 放大至 480 像素，完美契合标准 9:16 (270x480) 渲染层级
-	maxSize := 480
+	// 严格设定为 320 像素上限
+	maxSize := 320
 	var newW, newHeight int
 	if srcW > srcH {
 		newW = maxSize
@@ -712,7 +706,6 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 		newW = int(float64(srcW) * (float64(maxSize) / float64(srcH)))
 	}
 
-	// 严格控制行尾偶数偏转
 	newW = (newW / 2) * 2
 	newHeight = (newHeight / 2) * 2
 	if newW == 0 {
@@ -731,6 +724,7 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	}
 	defer outFile.Close()
 
+	// 使用品质 92 的 JPEG 编码，对于 320x320 尺寸的文件体积将绝对稳压在几十 KB（远低于 200KB 要求）
 	err = jpeg.Encode(outFile, dstImg, &jpeg.Options{Quality: 92})
 	if err != nil {
 		return "", false, err
