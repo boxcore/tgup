@@ -8,7 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"image"
-	_ "image/gif" // 注册解码器
+	_ "image/gif"
 	"image/jpeg"
 	_ "image/jpeg"
 	_ "image/png"
@@ -38,40 +38,35 @@ func main() {
 	// 1. 定义 Flags
 	var titleFlag string
 	var testFlag string
+	var cacheForceFlag bool
 
-	// 2. 兼容任意位置的位置参数与 Flags：手动从 os.Args 中分离出路径
-	var targetPath string
-	var remainArgs []string
-	remainArgs = append(remainArgs, os.Args[0]) // 保留程序名
-
-	for i := 1; i < len(os.Args); i++ {
-		arg := os.Args[i]
-		if !strings.HasPrefix(arg, "-") && targetPath == "" {
-			if i > 1 && (os.Args[i-1] == "--title" || os.Args[i-1] == "-title" || os.Args[i-1] == "-t" || os.Args[i-1] == "--test") {
-				remainArgs = append(remainArgs, arg)
-			} else {
-				targetPath = arg
-			}
-		} else {
-			remainArgs = append(remainArgs, arg)
-		}
-	}
-
-	// 将提取路径后的参数重新交给 flag 库解析
-	os.Args = remainArgs
 	flag.StringVar(&titleFlag, "title", "", "Specify a global caption title for the media group")
-	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command without uploading")
-	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command without uploading")
+	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command")
+	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command")
+
+	// 规范化布尔开关：--cache-force 或快捷缩写 -cf
+	flag.BoolVar(&cacheForceFlag, "cache-force", false, "Force regenerate and overwrite existing thumbnails/photos")
+	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
+
+	// 2. 官方标准解析
 	flag.Parse()
 
-	// 3. 检查路径
-	if targetPath == "" {
+	// 3. 获取剩余的位置参数（路径）
+	tailArgs := flag.Args()
+	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
-		fmt.Println("Usage: ./tgup [-t=curl] [--title=\"your title\"] <file_or_directory_path>")
+		fmt.Println("Usage: go run main.go [-t=curl] [--cache-force] [--title='title'] <path>")
 		os.Exit(1)
 	}
+	targetPath := tailArgs[0]
 
-	// 4. 初始化环境与加载配置
+	// 4. 统一别名状态
+	finalTestMode := testFlag
+	if finalTestMode == "" {
+		finalTestMode = flag.Lookup("test").Value.String()
+	}
+
+	// 5. 初始化环境与加载配置
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("Error getting home directory: %v\n", err)
@@ -91,7 +86,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 5. 解析目标路径获取文件列表
+	// 6. 解析目标路径获取文件列表
 	files, err := collectFiles(targetPath)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
@@ -102,22 +97,22 @@ func main() {
 		return
 	}
 
-	if testFlag != "curl" {
+	if finalTestMode != "curl" {
 		fmt.Printf("Found %d file(s) to upload.\n", len(files))
 	}
 
-	// 6. 决定全局标题
+	// 7. 决定全局标题
 	globalCaption := strings.TrimSpace(titleFlag)
-	if globalCaption == "" && testFlag != "curl" {
+	if globalCaption == "" && finalTestMode != "curl" {
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("Do you want to add a caption for this upload? (Press Enter to skip): ")
 		input, _ := reader.ReadString('\n')
 		globalCaption = strings.TrimSpace(input)
 	}
 
-	// 7. 初始化 Telegram Bot (非测试模式下严格验证)
+	// 8. 初始化 Telegram Bot
 	var bot *tgbotapi.BotAPI
-	if testFlag != "curl" {
+	if finalTestMode != "curl" {
 		bot, err = tgbotapi.NewBotAPIWithAPIEndpoint(config.BotAPI, config.TgAPIURL+"/bot%s/%s")
 		if err != nil {
 			fmt.Printf("Error initializing bot: %v\n", err)
@@ -126,7 +121,7 @@ func main() {
 		bot.Debug = false
 	}
 
-	// 8. 分批处理（每批最多10个文件）
+	// 9. 分批处理
 	const batchSize = 10
 	for i := 0; i < len(files); i += batchSize {
 		end := i + batchSize
@@ -135,23 +130,21 @@ func main() {
 		}
 		batch := files[i:end]
 
-		if testFlag == "curl" {
-			// 测试模式：生成并打印带元数据与动态大图检测的 curl
-			generateCurlCommand(config, batch, globalCaption, cacheDir)
+		if finalTestMode == "curl" {
+			generateCurlCommand(config, batch, globalCaption, cacheDir, cacheForceFlag)
 		} else {
-			// 正常模式：实际上传
 			fmt.Printf("\n--- Preparing batch: %d to %d (Total: %d) ---\n", i+1, end, len(files))
-			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir)
+			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag)
 		}
 	}
 
-	if testFlag != "curl" {
+	if finalTestMode != "curl" {
 		fmt.Println("\nAll uploads completed successfully!")
 	}
 }
 
-// checkAndResizePhoto 拦截检测图片像素：仅在超过2000万像素时进行高保真等比缩放到2000w以下
-func checkAndResizePhoto(photoPath string, cacheDir string) (string, error) {
+// checkAndResizePhoto 拦截检测大图像素
+func checkAndResizePhoto(photoPath string, cacheDir string, cacheForce bool) (string, error) {
 	file, err := os.Open(photoPath)
 	if err != nil {
 		return photoPath, err
@@ -188,8 +181,12 @@ func checkAndResizePhoto(photoPath string, cacheDir string) (string, error) {
 	tmpName := fmt.Sprintf("resized_20m_%s.jpg", hex.EncodeToString(hasher.Sum(nil)))
 	tmpPath := filepath.Join(cacheDir, tmpName)
 
-	if _, err := os.Stat(tmpPath); err == nil {
-		return tmpPath, nil
+	if !cacheForce {
+		if _, err := os.Stat(tmpPath); err == nil {
+			return tmpPath, nil
+		}
+	} else {
+		_ = os.Remove(tmpPath)
 	}
 
 	outFile, err := os.Create(tmpPath)
@@ -206,8 +203,22 @@ func checkAndResizePhoto(photoPath string, cacheDir string) (string, error) {
 	return tmpPath, nil
 }
 
-// generateCurlCommand 支持视频元数据、流支持、超限原图检测与1s SHA1缩略图的 curl 组装
-func generateCurlCommand(cfg *Config, files []string, globalCaption string, cacheDir string) {
+// getImageDimensions 读取本地图片的精确宽高
+func getImageDimensions(path string) (int, int) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+	cfg, _, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0
+	}
+	return cfg.Width, cfg.Height
+}
+
+// generateCurlCommand 生成测试 CURL 指令
+func generateCurlCommand(cfg *Config, files []string, globalCaption string, cacheDir string, cacheForce bool) {
 	hasMedia := false
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
@@ -262,11 +273,17 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 			thumbFormKey := fmt.Sprintf("thumb_video%d", videoIdx)
 			var thumbValue string
 
-			thumbPath, thumbErr := generateThumbnail(file, cacheDir)
+			thumbPath, isPortraitVideo, thumbErr := generateThumbnail(file, cacheDir, cacheForce)
 			if thumbErr == nil && thumbPath != "" {
 				absThumbPath, _ := filepath.Abs(thumbPath)
 				thumbValue = fmt.Sprintf("attach://%s", thumbFormKey)
 				fileFormFields = append(fileFormFields, fmt.Sprintf("     -F \"%s=@%s\"", thumbFormKey, absThumbPath))
+			} else if thumbErr != nil {
+				fmt.Printf("[Debug Error] Thumbnail generation failed for %s: %v\n", filepath.Base(file), thumbErr)
+			}
+
+			if isPortraitVideo && width > height {
+				width, height = height, width
 			}
 
 			mediaJSONArray = append(mediaJSONArray, TgMediaItem{
@@ -289,7 +306,7 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 			attachKey = fmt.Sprintf("photo%d", photoIdx)
 			photoIdx++
 
-			finalPhotoPath, _ := checkAndResizePhoto(file, cacheDir)
+			finalPhotoPath, _ := checkAndResizePhoto(file, cacheDir, cacheForce)
 			absPath, _ := filepath.Abs(finalPhotoPath)
 
 			mediaJSONArray = append(mediaJSONArray, TgMediaItem{
@@ -331,7 +348,6 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 	fmt.Println("----------------------------------------------------------------------")
 }
 
-// writeLog 封装通用日志追加写入方法
 func writeLog(logDir string, filename string, content string) {
 	logPath := filepath.Join(logDir, filename)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -343,7 +359,6 @@ func writeLog(logDir string, filename string, content string) {
 	_, _ = f.WriteString(content)
 }
 
-// loadConfig 读取并解析配置文件
 func loadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -353,7 +368,7 @@ func loadConfig(path string) (*Config, error) {
 
 	cfg := &Config{
 		PhotoExts: []string{".jpg", ".jpeg", ".png"},
-		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov"},
+		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
 	}
 
 	scanner := bufio.NewScanner(file)
@@ -398,7 +413,6 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, scanner.Err()
 }
 
-// collectFiles 递归获取目录下的文件（自动过滤隐藏文件）
 func collectFiles(targetPath string) ([]string, error) {
 	fi, err := os.Stat(targetPath)
 	if err != nil {
@@ -425,18 +439,18 @@ func collectFiles(targetPath string) ([]string, error) {
 	return files, err
 }
 
-// contains 判断切片中是否包含某个字符串
 func contains(slice []string, val string) bool {
 	for _, item := range slice {
-		if item == val {
+		itemLower := strings.ToLower(item)
+		valLower := strings.ToLower(val)
+		if itemLower == valLower {
 			return true
 		}
 	}
 	return false
 }
 
-// uploadMediaGroup 处理单批次文件的类型判断、批量发送与日志存储
-func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string) {
+func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool) {
 	hasMedia := false
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
@@ -476,19 +490,23 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 			width, height, duration, err := getVideoMeta(file)
 			if err == nil {
+				thumbPath, isPortraitVideo, thumbErr := generateThumbnail(file, cacheDir, cacheForce)
+				if thumbErr == nil && thumbPath != "" {
+					videoMedia.Thumb = tgbotapi.FilePath(thumbPath)
+
+					if isPortraitVideo && width > height {
+						width, height = height, width
+					}
+				}
+
 				videoMedia.Width = width
 				videoMedia.Height = height
 				videoMedia.Duration = duration
-
-				thumbPath, thumbErr := generateThumbnail(file, cacheDir)
-				if thumbErr == nil {
-					videoMedia.Thumb = tgbotapi.FilePath(thumbPath)
-				}
 			}
 			mediaFiles = append(mediaFiles, videoMedia)
 
 		} else if isPhoto {
-			optimizedPath, _ := checkAndResizePhoto(file, cacheDir)
+			optimizedPath, _ := checkAndResizePhoto(file, cacheDir, cacheForce)
 
 			reqFile := getProgressRequestFile(optimizedPath)
 			processedFiles = append(processedFiles, file)
@@ -521,7 +539,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 	if err != nil {
 		fmt.Printf("\nFailed to send media group: %v\n", err)
-
 		if strings.Contains(err.Error(), "PHOTO_INVALID_DIMENSIONS") {
 			fmt.Println("⚠️ Detected PHOTO_INVALID_DIMENSIONS. Retrying upload by degrading all items to Safe Document Mode...")
 			retryMediaFiles := make([]interface{}, len(processedFiles))
@@ -561,7 +578,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 	}
 }
 
-// getProgressRequestFile 拦截文件读取并渲染终端进度条
 func getProgressRequestFile(path string) tgbotapi.RequestFileData {
 	file, err := os.Open(path)
 	if err != nil {
@@ -596,7 +612,6 @@ func getProgressRequestFile(path string) tgbotapi.RequestFileData {
 	}
 }
 
-// getVideoMeta 使用 ffprobe 获取视频宽高与时长
 func getVideoMeta(videoPath string) (width int, height int, duration int, err error) {
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "default=noprint_wrappers=1", videoPath)
 	out, err := cmd.Output()
@@ -627,35 +642,107 @@ func getVideoMeta(videoPath string) (width int, height int, duration int, err er
 	return width, height, duration, nil
 }
 
-// generateThumbnail 使用 ffmpeg 提取视频缩略图
-func generateThumbnail(videoPath string, cacheDir string) (string, error) {
-	tempThumb := filepath.Join(cacheDir, "temp_proto_thumb.jpg")
-	_ = os.Remove(tempThumb)
-
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", tempThumb)
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
-
-	data, err := os.ReadFile(tempThumb)
-	if err != nil {
-		return "", err
-	}
-
-	hasher := sha1.New()
-	hasher.Write(data)
-	sha1Name := hex.EncodeToString(hasher.Sum(nil)) + ".jpg"
+// generateThumbnail 降维打击版：FFmpeg 仅负责提取 1:1 原始单帧图片，所有等比缩放和横竖判断交由 Go 内存库处理，彻底规避任何 FFmpeg 参数报错
+func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path string, isPortrait bool, err error) {
+	hasherName := sha1.New()
+	hasherName.Write([]byte(videoPath))
+	sha1Name := hex.EncodeToString(hasherName.Sum(nil)) + ".jpg"
 	finalThumbPath := filepath.Join(cacheDir, sha1Name)
 
-	if _, err := os.Stat(finalThumbPath); err == nil {
-		_ = os.Remove(tempThumb)
-		return finalThumbPath, nil
+	isCacheValid := false
+
+	if !cacheForce {
+		if fi, err := os.Stat(finalThumbPath); err == nil {
+			if fi.Size() > 10 {
+				tW, tH := getImageDimensions(finalThumbPath)
+				if tW > 0 && tH > 0 && tW <= 320 && tH <= 320 {
+					isCacheValid = true
+					if tH > tW {
+						isPortrait = true
+					}
+				}
+			}
+		}
 	}
 
-	err = os.Rename(tempThumb, finalThumbPath)
+	if isCacheValid {
+		return finalThumbPath, isPortrait, nil
+	}
+
+	_ = os.Remove(finalThumbPath)
+
+	// 定义一个中间临时原图路径
+	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
+	_ = os.Remove(rawTempJpg)
+
+	// 【第一步】：不带任何 scale 滤镜和多余表达式，只让 FFmpeg 纯粹、安全地在第 2 秒切出一个原始单帧
+	// 调整寻帧顺序：把 -ss 放在 -i 后面，确保流媒体容器索引异常时依然能精确强制执行
+	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:02", "-vframes", "1", "-q:v", "2", rawTempJpg)
+	if err := cmd.Run(); err != nil {
+		// 降级：如果视频不足 2 秒，从第 0 秒强行抽帧
+		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
+		if errFallback := cmdFallback.Run(); errFallback != nil {
+			return "", false, fmt.Errorf("ffmpeg raw frame extraction failed: %v", errFallback)
+		}
+	}
+	defer os.Remove(rawTempJpg) // 处理完自动销毁大原图
+
+	// 【第二步】：将缩放和偶数边界控制收回到 Go 内存库中处理
+	rawFile, err := os.Open(rawTempJpg)
 	if err != nil {
-		return tempThumb, nil
+		return "", false, err
 	}
 
-	return finalThumbPath, nil
+	srcImg, _, err := image.Decode(rawFile)
+	rawFile.Close()
+	if err != nil {
+		return "", false, fmt.Errorf("failed to decode raw frame image: %v", err)
+	}
+
+	bounds := srcImg.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+
+	// 计算等比缩放大小，锁定最大边长为 320px
+	var newW, newHeight int
+	if srcW > srcH {
+		newW = 320
+		newHeight = int(float64(srcH) * (320.0 / float64(srcW)))
+	} else {
+		newHeight = 320
+		newW = int(float64(srcW) * (320.0 / float64(srcH)))
+	}
+
+	// 强制向下取偶数，保证 100% 的 JPEG 编码兼容性
+	newW = (newW / 2) * 2
+	newHeight = (newHeight / 2) * 2
+	if newW == 0 {
+		newW = 2
+	}
+	if newHeight == 0 {
+		newHeight = 2
+	}
+
+	// 进行高保真缩放
+	dstImg := image.NewRGBA(image.Rect(0, 0, newW, newHeight))
+	draw.CatmullRom.Scale(dstImg, dstImg.Bounds(), srcImg, srcImg.Bounds(), draw.Over, nil)
+
+	// 保存最终的轻量缩略图
+	outFile, err := os.Create(finalThumbPath)
+	if err != nil {
+		return "", false, err
+	}
+	defer outFile.Close()
+
+	err = jpeg.Encode(outFile, dstImg, &jpeg.Options{Quality: 90})
+	if err != nil {
+		return "", false, err
+	}
+
+	// 逆向判定：根据 Go 库真实解码出来的画布判定是不是竖屏
+	if newHeight > newW {
+		isPortrait = true
+	}
+
+	return finalThumbPath, isPortrait, nil
 }
