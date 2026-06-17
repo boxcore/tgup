@@ -66,11 +66,12 @@ type TgMediaItem struct {
 	Thumb             string `json:"thumb,omitempty"`
 }
 
-// fileSortItem 用来做 WebDAV 单次时间快照缓存，防止反复读取导致网盘接口卡死
+// fileSortItem 用来做 WebDAV 单次时间与大小快照缓存，防止反复读取导致网盘接口卡死
 type fileSortItem struct {
 	path    string
 	modTime time.Time
 	creTime time.Time
+	size    int64 // 文件大小快照（字节）
 }
 
 func main() {
@@ -117,7 +118,7 @@ func main() {
 	flag.StringVar(&typeFilterFlag, "type", "all", "Filter media type: pic, video, all, or specific ext like m4v")
 	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration in seconds between batch uploads")
 	flag.BoolVar(&transcodeFlag, "transcode", false, "Enable on-the-fly FFmpeg transcoding for non-standard videos")
-	flag.StringVar(&sortFlag, "sort", "name", "Sort files by: name (natural order), mod (modification time), create (creation time)")
+	flag.StringVar(&sortFlag, "sort", "name", "Sort files by: name, mod, create, size, size_desc")
 
 	// 2. 官方标准解析
 	flag.Parse()
@@ -163,14 +164,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. 解析目标路径获取文件列表（内置跨平台兼容反射与自然数字重排机制）
+	// 6. 解析目标路径获取文件列表
 	rawFiles, err := collectFiles(targetPath, sortFlag)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 7. 高级动态过滤：根据 -type 参数（大类或具体后缀）进行细分筛选
+	// 7. 高级动态过滤：根据 -type 参数进行细分筛选
 	var files []string
 	typeFilterFlag = strings.ToLower(strings.TrimSpace(typeFilterFlag))
 	for _, file := range rawFiles {
@@ -178,7 +179,6 @@ func main() {
 		isPhoto := contains(config.PhotoExts, ext)
 		isVideo := contains(config.VideoExts, ext)
 
-		// 优先处理特定文件后缀过滤（如 -type=m4v 或 -type=.m4v）
 		if typeFilterFlag != "all" && typeFilterFlag != "pic" && typeFilterFlag != "video" && typeFilterFlag != "vedio" {
 			targetExt := typeFilterFlag
 			if !strings.HasPrefix(targetExt, ".") {
@@ -188,7 +188,6 @@ func main() {
 				continue
 			}
 		} else {
-			// 处理常规大类过滤
 			if typeFilterFlag == "pic" && !isPhoto {
 				continue
 			}
@@ -208,20 +207,59 @@ func main() {
 		return
 	}
 
-	// 🚀 【拦截器】：处理 -t=list / --test=list 预检模式
+	// 🚀 【高级审计拦截器】：处理 -t=list / --test=list 预检模式（包含简短双时间 + 年份显示）
 	if finalTestMode == "list" {
-		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个):\n", len(files))
+		totalBatches := (len(files) + batchSizeFlag - 1) / batchSizeFlag
+
+		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个，每批 %d 个，将分 %d 批循环执行):\n", len(files), batchSizeFlag, totalBatches)
 		fmt.Println(strings.Repeat("-", 60))
+
 		for idx, file := range files {
 			fi, err := os.Stat(file)
 			sizeStr := "Unknown"
+			cTimeStr := "--"
+			mTimeStr := "--"
+
 			if err == nil {
 				sizeStr = fmt.Sprintf("%.2f MB", float64(fi.Size())/1024.0/1024.0)
+
+				mTime := fi.ModTime()
+				cTime := mTime
+
+				if sys := fi.Sys(); sys != nil {
+					v := reflect.ValueOf(sys).Elem()
+					statField := v.FieldByName("Ctim")
+					if !statField.IsValid() {
+						statField = v.FieldByName("Ctimespec")
+					}
+					if statField.IsValid() {
+						secField := statField.FieldByName("Sec")
+						nsecField := statField.FieldByName("Nsec")
+						if secField.IsValid() && nsecField.IsValid() {
+							cTime = time.Unix(secField.Int(), nsecField.Int())
+						}
+					}
+				}
+
+				// 💡 【核心修改点】：引入 4 位标准年份
+				cTimeStr = cTime.Format("2006-01-02 15:04")
+				mTimeStr = mTime.Format("2006-01-02 15:04")
 			}
-			fmt.Printf("[%03d] %s (%s)\n", idx+1, filepath.Base(file), sizeStr)
+
+			fmt.Printf("[%03d] %s (%s | C:%s M:%s)\n", idx+1, filepath.Base(file), sizeStr, cTimeStr, mTimeStr)
+
+			if (idx+1)%batchSizeFlag == 0 || (idx+1) == len(files) {
+				currentBatch := (idx / batchSizeFlag) + 1
+				itemsInBatch := batchSizeFlag
+				if (idx+1) == len(files) && len(files)%batchSizeFlag != 0 {
+					itemsInBatch = len(files) % batchSizeFlag
+				}
+
+				fmt.Printf("📦 👆 以上为 [第 %d / %d 批次] 预检包 (包含 %d 个文件) 👆\n", currentBatch, totalBatches, itemsInBatch)
+				fmt.Println(strings.Repeat("-", 60))
+			}
 		}
-		fmt.Println(strings.Repeat("-", 60))
-		return // 拦截退出，不触发后续任何上传与网盘探测
+		return
 	}
 
 	if finalTestMode != "curl" {
@@ -255,7 +293,6 @@ func main() {
 		}
 		batch := files[i:end]
 
-		// 【WebDAV 专属流控】：只在轮到当前批次时，才对本批次进行单线程顺序探测，且处理完歇一歇
 		if finalTestMode != "curl" {
 			fmt.Printf("⚡ 正在有序预处理当前批次 (%d/%d) 的 WebDAV 缓存...\n", i+1, end)
 			for _, file := range batch {
@@ -273,7 +310,6 @@ func main() {
 			fmt.Printf("\n--- Preparing batch: %d to %d (Total: %d) ---\n", i+1, end, len(files))
 			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag, transcodeFlag)
 
-			// 批次间物理隔离冷却
 			if end < len(files) && sleepDurationFlag > 0 {
 				fmt.Printf("🛋️ 批次发送完毕，主动进入 %d 秒战略冷却...\n", sleepDurationFlag)
 				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
@@ -469,7 +505,6 @@ func writeLog(logDir string, filename string, content string) {
 	_, _ = f.WriteString(content)
 }
 
-// loadConfig 智能防呆版：全自动修复前导点号大小写异常
 func loadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -538,7 +573,7 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, scanner.Err()
 }
 
-// collectFiles 跨平台无损升级版：利用反射机制完美兼容 Mac 和 Linux 的底层 ctime 字段读取
+// collectFiles 跨平台无损升级版：利用反射机制完美兼容 Mac 和 Linux 的底层 ctime 读取，外加大小双向排序
 func collectFiles(targetPath string, sortType string) ([]string, error) {
 	fi, err := os.Stat(targetPath)
 	if err != nil {
@@ -561,19 +596,17 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 			}
 
 			mTime := info.ModTime()
-			cTime := mTime // 默认保底
+			cTime := mTime
+			fSize := info.Size()
 
-			// 🚀 【关键高弹反射区】：动态解耦跨平台字段检查
 			if sys := info.Sys(); sys != nil {
 				v := reflect.ValueOf(sys).Elem()
 
-				// 尝试匹配 Linux 的 Ctim 或是 Mac 的 Ctimespec
 				statField := v.FieldByName("Ctim")
 				if !statField.IsValid() {
 					statField = v.FieldByName("Ctimespec")
 				}
 
-				// 提取底层高精秒级时间数据
 				if statField.IsValid() {
 					secField := statField.FieldByName("Sec")
 					nsecField := statField.FieldByName("Nsec")
@@ -587,6 +620,7 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 				path:    path,
 				modTime: mTime,
 				creTime: cTime,
+				size:    fSize,
 			})
 		}
 		return nil
@@ -595,21 +629,18 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 		return nil, err
 	}
 
-	// 纯本地内存快照排序，不会触发网盘任何重复网络寻道
 	sortType = strings.ToLower(strings.TrimSpace(sortType))
 	switch sortType {
 	case "mod", "mtime":
-		sort.Slice(items, func(i, j int) bool {
-			return items[i].modTime.Before(items[j].modTime)
-		})
+		sort.Slice(items, func(i, j int) bool { return items[i].modTime.Before(items[j].modTime) })
 	case "create", "ctime":
-		sort.Slice(items, func(i, j int) bool {
-			return items[i].creTime.Before(items[j].creTime)
-		})
+		sort.Slice(items, func(i, j int) bool { return items[i].creTime.Before(items[j].creTime) })
+	case "size", "size_asc", "sizeasc":
+		sort.Slice(items, func(i, j int) bool { return items[i].size < items[j].size })
+	case "size_desc", "sizedesc":
+		sort.Slice(items, func(i, j int) bool { return items[i].size > items[j].size })
 	default: // name
-		sort.Slice(items, func(i, j int) bool {
-			return isLessNatural(items[i].path, items[j].path)
-		})
+		sort.Slice(items, func(i, j int) bool { return isLessNatural(items[i].path, items[j].path) })
 	}
 
 	var sortedFiles []string
@@ -720,7 +751,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 
 				if p.NeedTranscode {
-					// 🚀 2核CPU最高效率极限降维转码内核：指定 veryfast、双核threads约束、等比强行收拢至 720p 像素矩阵矩阵
 					cmd := exec.Command("ffmpeg", "-y", "-threads", "2", "-i", p.FilePath,
 						"-c:v", "libx264", "-preset", "veryfast",
 						"-vf", "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'",
@@ -816,7 +846,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 			return
 		}
 
-		// 💥 渐进式指数退避算法：有效解决重试再次撞上官方滑动时间窗口风控的痛点
 		bodyStr := string(respBody)
 		if strings.Contains(bodyStr, "Too Many Requests") || strings.Contains(bodyStr, "retry after") {
 			waitSeconds := 10
@@ -833,7 +862,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 			}
 
-			// 核心抗风控延迟递增公式
 			actualWait := waitSeconds + 5 + (retry * 15)
 
 			fmt.Printf("\n⚠️ 触发 Telegram 官方频控。服务器返回: %s\n", bodyStr)
@@ -893,9 +921,9 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	if err != nil {
 		return 0, 0, 0, "", false, fmt.Errorf("ffprobe cloud query failed: %v", err)
 	}
-	scanner := bufio.NewScanner(strings.NewReader(string(outProbe)))
-	for scanner.Scan() {
-		line := scanner.Text()
+	parentScanner := bufio.NewScanner(strings.NewReader(string(outProbe)))
+	for parentScanner.Scan() {
+		line := parentScanner.Text()
 		parts := strings.Split(line, "=")
 		if len(parts) != 2 {
 			continue
@@ -993,7 +1021,6 @@ func contains(slice []string, val string) bool {
 	return false
 }
 
-// isLessNatural 自然数字排序核心算法：全自动兼容 1, 2, 18, 105 人类直觉升序排列
 func isLessNatural(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
