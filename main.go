@@ -366,6 +366,7 @@ func loadConfig(path string) (*Config, error) {
 	}
 	defer file.Close()
 
+	// 原生支持白名单加入 .m4v
 	cfg := &Config{
 		PhotoExts: []string{".jpg", ".jpeg", ".png"},
 		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
@@ -642,7 +643,7 @@ func getVideoMeta(videoPath string) (width int, height int, duration int, err er
 	return width, height, duration, nil
 }
 
-// generateThumbnail 降维打击版：FFmpeg 仅负责提取 1:1 原始单帧图片，所有等比缩放和横竖判断交由 Go 内存库处理，彻底规避任何 FFmpeg 参数报错
+// generateThumbnail 降维打击版：FFmpeg 负责抽取物理旋转对齐的原帧，Go 负责在内存进行 480px 偶数限边等比缩放
 func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path string, isPortrait bool, err error) {
 	hasherName := sha1.New()
 	hasherName.Write([]byte(videoPath))
@@ -655,7 +656,7 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 		if fi, err := os.Stat(finalThumbPath); err == nil {
 			if fi.Size() > 10 {
 				tW, tH := getImageDimensions(finalThumbPath)
-				if tW > 0 && tH > 0 && tW <= 320 && tH <= 320 {
+				if tW > 0 && tH > 0 && tW <= 480 && tH <= 480 {
 					isCacheValid = true
 					if tH > tW {
 						isPortrait = true
@@ -671,23 +672,20 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 
 	_ = os.Remove(finalThumbPath)
 
-	// 定义一个中间临时原图路径
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
 
-	// 【第一步】：不带任何 scale 滤镜和多余表达式，只让 FFmpeg 纯粹、安全地在第 2 秒切出一个原始单帧
-	// 调整寻帧顺序：把 -ss 放在 -i 后面，确保流媒体容器索引异常时依然能精确强制执行
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:02", "-vframes", "1", "-q:v", "2", rawTempJpg)
+	// 只让 FFmpeg 摆正旋转并抽取第 1 秒的单帧原图，绝不再带多余表达式滤镜
+	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vf", "autorotate=1", "-vframes", "1", "-q:v", "2", rawTempJpg)
 	if err := cmd.Run(); err != nil {
-		// 降级：如果视频不足 2 秒，从第 0 秒强行抽帧
-		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
+		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vf", "autorotate=1", "-vframes", "1", "-q:v", "2", rawTempJpg)
 		if errFallback := cmdFallback.Run(); errFallback != nil {
 			return "", false, fmt.Errorf("ffmpeg raw frame extraction failed: %v", errFallback)
 		}
 	}
-	defer os.Remove(rawTempJpg) // 处理完自动销毁大原图
+	defer os.Remove(rawTempJpg)
 
-	// 【第二步】：将缩放和偶数边界控制收回到 Go 内存库中处理
+	// 解码真正立起来的、画面无黑帧的图像数据
 	rawFile, err := os.Open(rawTempJpg)
 	if err != nil {
 		return "", false, err
@@ -703,17 +701,18 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
 
-	// 计算等比缩放大小，锁定最大边长为 320px
+	// 放大至 480 像素，完美契合标准 9:16 (270x480) 渲染层级
+	maxSize := 480
 	var newW, newHeight int
 	if srcW > srcH {
-		newW = 320
-		newHeight = int(float64(srcH) * (320.0 / float64(srcW)))
+		newW = maxSize
+		newHeight = int(float64(srcH) * (float64(maxSize) / float64(srcW)))
 	} else {
-		newHeight = 320
-		newW = int(float64(srcW) * (320.0 / float64(srcH)))
+		newHeight = maxSize
+		newW = int(float64(srcW) * (float64(maxSize) / float64(srcH)))
 	}
 
-	// 强制向下取偶数，保证 100% 的 JPEG 编码兼容性
+	// 严格控制行尾偶数偏转
 	newW = (newW / 2) * 2
 	newHeight = (newHeight / 2) * 2
 	if newW == 0 {
@@ -723,23 +722,20 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 		newHeight = 2
 	}
 
-	// 进行高保真缩放
 	dstImg := image.NewRGBA(image.Rect(0, 0, newW, newHeight))
 	draw.CatmullRom.Scale(dstImg, dstImg.Bounds(), srcImg, srcImg.Bounds(), draw.Over, nil)
 
-	// 保存最终的轻量缩略图
 	outFile, err := os.Create(finalThumbPath)
 	if err != nil {
 		return "", false, err
 	}
 	defer outFile.Close()
 
-	err = jpeg.Encode(outFile, dstImg, &jpeg.Options{Quality: 90})
+	err = jpeg.Encode(outFile, dstImg, &jpeg.Options{Quality: 92})
 	if err != nil {
 		return "", false, err
 	}
 
-	// 逆向判定：根据 Go 库真实解码出来的画布判定是不是竖屏
 	if newHeight > newW {
 		isPortrait = true
 	}
