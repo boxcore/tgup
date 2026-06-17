@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -65,6 +66,13 @@ type TgMediaItem struct {
 	Thumb             string `json:"thumb,omitempty"`
 }
 
+// fileSortItem 用来做 WebDAV 单次时间快照缓存，防止反复读取导致网盘接口卡死
+type fileSortItem struct {
+	path    string
+	modTime time.Time
+	creTime time.Time
+}
+
 func main() {
 	// 【📢 混放参数自动识别器】：由于 Go 原生 flag 库在遇到第一个位置参数（路径）后会停止解析后面的参数，
 	// 我们在这里手动将位置参数（路径）剥离并一律追加到最后面，完美达成 GNU getopt 选项随意混放的效果。
@@ -76,7 +84,7 @@ func main() {
 			flagArgs = append(flagArgs, arg)
 			if !strings.Contains(arg, "=") {
 				flagName := strings.TrimLeft(arg, "-")
-				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" {
+				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" || flagName == "sort" {
 					if i+1 < len(os.Args) {
 						flagArgs = append(flagArgs, os.Args[i+1])
 						i++
@@ -97,10 +105,11 @@ func main() {
 	var typeFilterFlag string
 	var sleepDurationFlag int
 	var transcodeFlag bool
+	var sortFlag string
 
 	flag.StringVar(&titleFlag, "title", "", "Specify a global caption title for the media group")
-	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command")
-	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command")
+	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command, '-t=list' to show files")
+	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command, '--test=list' to show files")
 	flag.BoolVar(&cacheForceFlag, "cache-force", false, "Force regenerate and overwrite existing thumbnails/photos")
 	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
 
@@ -108,6 +117,7 @@ func main() {
 	flag.StringVar(&typeFilterFlag, "type", "all", "Filter media type: pic, video, all, or specific ext like m4v")
 	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration in seconds between batch uploads")
 	flag.BoolVar(&transcodeFlag, "transcode", false, "Enable on-the-fly FFmpeg transcoding for non-standard videos")
+	flag.StringVar(&sortFlag, "sort", "name", "Sort files by: name (natural order), mod (modification time), create (creation time)")
 
 	// 2. 官方标准解析
 	flag.Parse()
@@ -116,7 +126,7 @@ func main() {
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
-		fmt.Println("Usage: go run main.go [-n=10] [-type=video] [--transcode] [-s=5] <path>")
+		fmt.Println("Usage: go run main.go [-n=10] [-type=video] [--transcode] [--sort=name] [-s=5] <path>")
 		os.Exit(1)
 	}
 	targetPath := tailArgs[0]
@@ -153,8 +163,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. 解析目标路径获取文件列表（内部已包含人类直觉自然数字排序逻辑）
-	rawFiles, err := collectFiles(targetPath)
+	// 6. 解析目标路径获取文件列表（内置跨平台兼容反射与自然数字重排机制）
+	rawFiles, err := collectFiles(targetPath, sortFlag)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
 		os.Exit(1)
@@ -196,6 +206,22 @@ func main() {
 	if len(files) == 0 {
 		fmt.Println("No valid files found matching the specific type criteria.")
 		return
+	}
+
+	// 🚀 【拦截器】：处理 -t=list / --test=list 预检模式
+	if finalTestMode == "list" {
+		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个):\n", len(files))
+		fmt.Println(strings.Repeat("-", 60))
+		for idx, file := range files {
+			fi, err := os.Stat(file)
+			sizeStr := "Unknown"
+			if err == nil {
+				sizeStr = fmt.Sprintf("%.2f MB", float64(fi.Size())/1024.0/1024.0)
+			}
+			fmt.Printf("[%03d] %s (%s)\n", idx+1, filepath.Base(file), sizeStr)
+		}
+		fmt.Println(strings.Repeat("-", 60))
+		return // 拦截退出，不触发后续任何上传与网盘探测
 	}
 
 	if finalTestMode != "curl" {
@@ -512,17 +538,18 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, scanner.Err()
 }
 
-// collectFiles 内置人类直觉自然数字排序内核
-func collectFiles(targetPath string) ([]string, error) {
+// collectFiles 跨平台无损升级版：利用反射机制完美兼容 Mac 和 Linux 的底层 ctime 字段读取
+func collectFiles(targetPath string, sortType string) ([]string, error) {
 	fi, err := os.Stat(targetPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var files []string
 	if !fi.IsDir() {
 		return []string{targetPath}, nil
 	}
+
+	var items []fileSortItem
 
 	err = filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -532,7 +559,35 @@ func collectFiles(targetPath string) ([]string, error) {
 			if strings.HasPrefix(info.Name(), ".") {
 				return nil
 			}
-			files = append(files, path)
+
+			mTime := info.ModTime()
+			cTime := mTime // 默认保底
+
+			// 🚀 【关键高弹反射区】：动态解耦跨平台字段检查
+			if sys := info.Sys(); sys != nil {
+				v := reflect.ValueOf(sys).Elem()
+
+				// 尝试匹配 Linux 的 Ctim 或是 Mac 的 Ctimespec
+				statField := v.FieldByName("Ctim")
+				if !statField.IsValid() {
+					statField = v.FieldByName("Ctimespec")
+				}
+
+				// 提取底层高精秒级时间数据
+				if statField.IsValid() {
+					secField := statField.FieldByName("Sec")
+					nsecField := statField.FieldByName("Nsec")
+					if secField.IsValid() && nsecField.IsValid() {
+						cTime = time.Unix(secField.Int(), nsecField.Int())
+					}
+				}
+			}
+
+			items = append(items, fileSortItem{
+				path:    path,
+				modTime: mTime,
+				creTime: cTime,
+			})
 		}
 		return nil
 	})
@@ -540,15 +595,32 @@ func collectFiles(targetPath string) ([]string, error) {
 		return nil, err
 	}
 
-	// 🚀 【关键修复】：应用自定义的高精自然数字排序算法，纠正 1, 100, 11 倒序问题
-	sort.Slice(files, func(i, j int) bool {
-		return isLessNatural(files[i], files[j])
-	})
+	// 纯本地内存快照排序，不会触发网盘任何重复网络寻道
+	sortType = strings.ToLower(strings.TrimSpace(sortType))
+	switch sortType {
+	case "mod", "mtime":
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].modTime.Before(items[j].modTime)
+		})
+	case "create", "ctime":
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].creTime.Before(items[j].creTime)
+		})
+	default: // name
+		sort.Slice(items, func(i, j int) bool {
+			return isLessNatural(items[i].path, items[j].path)
+		})
+	}
 
-	return files, nil
+	var sortedFiles []string
+	for _, item := range items {
+		sortedFiles = append(sortedFiles, item.path)
+	}
+
+	return sortedFiles, nil
 }
 
-// uploadMediaGroup 自适应流式控流版：结合 io.Pipe 和 2核VPS极速降维转码管道
+// uploadMediaGroup 自适应流式控流版：集成 io.Pipe、2核VPS降维转码、高精渐进式退避频控自愈机制
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool, transcodeFlag bool) {
 	var mediaJSONArray []TgMediaItem
 	var payloads []FilePayload
@@ -648,7 +720,7 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 
 				if p.NeedTranscode {
-					// 🚀 2核CPU性能压榨转码引擎：指定 veryfast 预设、threads双核硬限、等比降维 720p
+					// 🚀 2核CPU最高效率极限降维转码内核：指定 veryfast、双核threads约束、等比强行收拢至 720p 像素矩阵矩阵
 					cmd := exec.Command("ffmpeg", "-y", "-threads", "2", "-i", p.FilePath,
 						"-c:v", "libx264", "-preset", "veryfast",
 						"-vf", "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'",
@@ -723,7 +795,13 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 		client := &http.Client{Timeout: 0}
 		resp, err := client.Do(req)
+
+		currentTimeStr := time.Now().Format("2006-01-02 15:04:05")
+		fileListStr := strings.Join(files, ", ")
+
 		if err != nil {
+			errLogContent := fmt.Sprintf("[%s] ERROR: %v | Files attempted: [%s]\n", currentTimeStr, err, fileListStr)
+			writeLog(logDir, "error.log", errLogContent)
 			fmt.Printf("Upload request failed: %v\n", err)
 			return
 		}
@@ -733,9 +811,12 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 		if resp.StatusCode == http.StatusOK {
 			fmt.Println("Batch upload success.")
+			okLogContent := fmt.Sprintf("[%s] SUCCESS: Status: %d | Files uploaded: [%s]\n", currentTimeStr, resp.StatusCode, fileListStr)
+			writeLog(logDir, "ok.log", okLogContent)
 			return
 		}
 
+		// 💥 渐进式指数退避算法：有效解决重试再次撞上官方滑动时间窗口风控的痛点
 		bodyStr := string(respBody)
 		if strings.Contains(bodyStr, "Too Many Requests") || strings.Contains(bodyStr, "retry after") {
 			waitSeconds := 10
@@ -752,20 +833,22 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 				}
 			}
 
-			// 🚀 【精准优化点】：引入渐进式退避算法
-			// 机制：官方要求秒数 + 5秒基础缓冲 + (当前重试轮次 * 15秒延迟叠加)
-			// 第一轮重试：等 8 + 5 + 0 = 13秒
-			// 第二轮重试：等 8 + 5 + 15 = 28秒（让云端滑动窗口彻底冷却）
+			// 核心抗风控延迟递增公式
 			actualWait := waitSeconds + 5 + (retry * 15)
 
 			fmt.Printf("\n⚠️ 触发 Telegram 官方频控。服务器返回: %s\n", bodyStr)
 			fmt.Printf("💤 为彻底清空云端权重，当前第 %d 次重试将主动高精度休眠 %d 秒...\n\n", retry+1, actualWait)
+
+			errLogContent := fmt.Sprintf("[%s] RETRY-%d: FloodWait %d sec | Files: [%s]\n", currentTimeStr, retry+1, actualWait, fileListStr)
+			writeLog(logDir, "error.log", errLogContent)
 
 			time.Sleep(time.Duration(actualWait) * time.Second)
 			continue
 		}
 
 		fmt.Printf("\nTelegram API Error: Status %d, Body: %s\n", resp.StatusCode, bodyStr)
+		errLogContent := fmt.Sprintf("[%s] ERROR: Status %d | Body: %s | Files attempted: [%s]\n", currentTimeStr, resp.StatusCode, bodyStr, fileListStr)
+		writeLog(logDir, "error.log", errLogContent)
 		return
 	}
 	fmt.Println("\n❌ 当前批次已连续重试失败达到上限，放弃该批次。")
@@ -910,7 +993,7 @@ func contains(slice []string, val string) bool {
 	return false
 }
 
-// isLessNatural 核心算法：完美支持 1, 2, 17, 105 升序人类直觉重排
+// isLessNatural 自然数字排序核心算法：全自动兼容 1, 2, 18, 105 人类直觉升序排列
 func isLessNatural(a, b string) bool {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
