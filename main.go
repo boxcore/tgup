@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -10,9 +11,11 @@ import (
 	"image"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"math"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,11 +47,14 @@ func main() {
 	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command")
 	flag.StringVar(&testFlag, "test", "", "Test mode: use '--test=curl' to print curl command")
 
+	// 规范化布尔开关：--cache-force 或快捷缩写 -cf
 	flag.BoolVar(&cacheForceFlag, "cache-force", false, "Force regenerate and overwrite existing thumbnails/photos")
 	flag.BoolVar(&cacheForceFlag, "cf", false, "Force regenerate and overwrite existing thumbnails/photos (shorthand)")
 
+	// 2. 官方标准解析
 	flag.Parse()
 
+	// 3. 获取剩余的位置参数（路径）
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
@@ -57,11 +63,13 @@ func main() {
 	}
 	targetPath := tailArgs[0]
 
+	// 4. 统一别名状态
 	finalTestMode := testFlag
 	if finalTestMode == "" {
 		finalTestMode = flag.Lookup("test").Value.String()
 	}
 
+	// 5. 初始化环境与加载配置
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("Error getting home directory: %v\n", err)
@@ -81,6 +89,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 6. 解析目标路径获取文件列表
 	files, err := collectFiles(targetPath)
 	if err != nil {
 		fmt.Printf("Error accessing path: %v\n", err)
@@ -95,6 +104,7 @@ func main() {
 		fmt.Printf("Found %d file(s) to upload.\n", len(files))
 	}
 
+	// 7. 决定全局标题
 	globalCaption := strings.TrimSpace(titleFlag)
 	if globalCaption == "" && finalTestMode != "curl" {
 		reader := bufio.NewReader(os.Stdin)
@@ -103,6 +113,7 @@ func main() {
 		globalCaption = strings.TrimSpace(input)
 	}
 
+	// 8. 初始化 Telegram Bot (保留声明以向下兼容日志模块，实际发包使用原生 HTTP)
 	var bot *tgbotapi.BotAPI
 	if finalTestMode != "curl" {
 		bot, err = tgbotapi.NewBotAPIWithAPIEndpoint(config.BotAPI, config.TgAPIURL+"/bot%s/%s")
@@ -113,6 +124,7 @@ func main() {
 		bot.Debug = false
 	}
 
+	// 9. 分批处理
 	const batchSize = 10
 	for i := 0; i < len(files); i += batchSize {
 		end := i + batchSize
@@ -234,9 +246,7 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 	var fileFormFields []string
 	isFirstItem := true
 
-	photoIdx := 1
-	videoIdx := 1
-	docIdx := 1
+	photoIdx, videoIdx, docIdx := 1, 1, 1
 
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
@@ -253,8 +263,7 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 			isFirstItem = false
 		}
 
-		var itemType string
-		var attachKey string
+		var itemType, attachKey string
 
 		if isVideo {
 			itemType = "video"
@@ -269,11 +278,8 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 				absThumbPath, _ := filepath.Abs(thumbPath)
 				thumbValue = fmt.Sprintf("attach://%s", thumbFormKey)
 				fileFormFields = append(fileFormFields, fmt.Sprintf("     -F \"%s=@%s\"", thumbFormKey, absThumbPath))
-			} else if thumbErr != nil {
-				fmt.Printf("[Debug Error] Thumbnail generation failed for %s: %v\n", filepath.Base(file), thumbErr)
 			}
 
-			// 如果图片判定是竖屏，强行对调从视频读取的宽和高
 			if isPortraitVideo && width > height {
 				width, height = height, width
 			}
@@ -358,6 +364,7 @@ func loadConfig(path string) (*Config, error) {
 	}
 	defer file.Close()
 
+	// 兜底默认值
 	cfg := &Config{
 		PhotoExts: []string{".jpg", ".jpeg", ".png"},
 		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
@@ -442,6 +449,7 @@ func contains(slice []string, val string) bool {
 	return false
 }
 
+// uploadMediaGroup 实际上传功能：改用原生发包，解决旧版 Go 库丢失 Thumb 的缺陷
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool) {
 	hasMedia := false
 	for _, file := range files {
@@ -452,19 +460,46 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 		}
 	}
 
-	var mediaFiles []interface{}
-	var processedFiles []string
-	isFirstItem := true
-
+	var validFiles []string
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
 		isPhoto := contains(cfg.PhotoExts, ext)
 		isVideo := contains(cfg.VideoExts, ext)
-
 		if hasMedia && !isVideo && !isPhoto {
 			fmt.Printf("[Skipped] %s (Cannot mix general Document with Photo/Video in an album)\n", filepath.Base(file))
 			continue
 		}
+		validFiles = append(validFiles, file)
+	}
+
+	if len(validFiles) == 0 {
+		return
+	}
+
+	var requestBody bytes.Buffer
+	writer := multipart.NewWriter(&requestBody)
+
+	type TgMediaItem struct {
+		Type              string `json:"type"`
+		Media             string `json:"media"`
+		Caption           string `json:"caption,omitempty"`
+		Width             int    `json:"width,omitempty"`
+		Height            int    `json:"height,omitempty"`
+		Duration          int    `json:"duration,omitempty"`
+		SupportsStreaming bool   `json:"supports_streaming,omitempty"`
+		Thumb             string `json:"thumb,omitempty"`
+	}
+	var mediaJSONArray []TgMediaItem
+
+	_ = writer.WriteField("chat_id", strconv.FormatInt(chatID, 10))
+
+	isFirstItem := true
+	photoIdx, videoIdx, docIdx := 1, 1, 1
+
+	for _, file := range validFiles {
+		ext := strings.ToLower(filepath.Ext(file))
+		isPhoto := contains(cfg.PhotoExts, ext)
+		isVideo := contains(cfg.VideoExts, ext)
 
 		currentCaption := ""
 		if isFirstItem && globalCaption != "" {
@@ -472,135 +507,134 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 			isFirstItem = false
 		}
 
+		var itemType, attachKey string
+
 		if isVideo {
-			reqFile := getProgressRequestFile(file)
-			processedFiles = append(processedFiles, file)
+			itemType = "video"
+			attachKey = fmt.Sprintf("video%d", videoIdx)
+			width, height, duration, _ := getVideoMeta(file)
+			var thumbValue string
 
-			videoMedia := tgbotapi.NewInputMediaVideo(reqFile)
-			videoMedia.Caption = currentCaption
-			videoMedia.SupportsStreaming = true
-
-			width, height, duration, err := getVideoMeta(file)
-			if err == nil {
-				thumbPath, isPortraitVideo, thumbErr := generateThumbnail(file, cacheDir, cacheForce)
-				if thumbErr == nil && thumbPath != "" {
-					videoMedia.Thumb = tgbotapi.FilePath(thumbPath)
-
-					if isPortraitVideo && width > height {
-						width, height = height, width
-					}
-				}
-
-				videoMedia.Width = width
-				videoMedia.Height = height
-				videoMedia.Duration = duration
+			thumbPath, isPortraitVideo, thumbErr := generateThumbnail(file, cacheDir, cacheForce)
+			if thumbErr == nil && thumbPath != "" {
+				thumbFormKey := fmt.Sprintf("thumb_video%d", videoIdx)
+				thumbValue = fmt.Sprintf("attach://%s", thumbFormKey)
+				addFileToMultipart(writer, thumbFormKey, thumbPath, false)
 			}
-			mediaFiles = append(mediaFiles, videoMedia)
+
+			if isPortraitVideo && width > height {
+				width, height = height, width
+			}
+
+			mediaJSONArray = append(mediaJSONArray, TgMediaItem{
+				Type:              itemType,
+				Media:             fmt.Sprintf("attach://%s", attachKey),
+				Caption:           currentCaption,
+				Width:             width,
+				Height:            height,
+				Duration:          duration,
+				SupportsStreaming: true,
+				Thumb:             thumbValue,
+			})
+			videoIdx++
+			addFileToMultipart(writer, attachKey, file, true)
 
 		} else if isPhoto {
-			optimizedPath, _ := checkAndResizePhoto(file, cacheDir, cacheForce)
+			itemType = "photo"
+			attachKey = fmt.Sprintf("photo%d", photoIdx)
+			photoIdx++
 
-			reqFile := getProgressRequestFile(optimizedPath)
-			processedFiles = append(processedFiles, file)
-
-			photoMedia := tgbotapi.NewInputMediaPhoto(reqFile)
-			photoMedia.Caption = currentCaption
-
-			mediaFiles = append(mediaFiles, photoMedia)
-
+			finalPhotoPath, _ := checkAndResizePhoto(file, cacheDir, cacheForce)
+			mediaJSONArray = append(mediaJSONArray, TgMediaItem{
+				Type:    itemType,
+				Media:   fmt.Sprintf("attach://%s", attachKey),
+				Caption: currentCaption,
+			})
+			addFileToMultipart(writer, attachKey, finalPhotoPath, true)
 		} else {
-			reqFile := getProgressRequestFile(file)
-			processedFiles = append(processedFiles, file)
+			itemType = "document"
+			attachKey = fmt.Sprintf("doc%d", docIdx)
+			docIdx++
 
-			docMedia := tgbotapi.NewInputMediaDocument(reqFile)
-			docMedia.Caption = currentCaption
-
-			mediaFiles = append(mediaFiles, docMedia)
+			mediaJSONArray = append(mediaJSONArray, TgMediaItem{
+				Type:    itemType,
+				Media:   fmt.Sprintf("attach://%s", attachKey),
+				Caption: currentCaption,
+			})
+			addFileToMultipart(writer, attachKey, file, true)
 		}
 	}
 
-	if len(mediaFiles) == 0 {
+	mediaJSONBytes, _ := json.Marshal(mediaJSONArray)
+	_ = writer.WriteField("media", string(mediaJSONBytes))
+	_ = writer.Close()
+
+	apiURL := fmt.Sprintf("%s/bot%s/sendMediaGroup", cfg.TgAPIURL, cfg.BotAPI)
+	req, err := http.NewRequest("POST", apiURL, &requestBody)
+	if err != nil {
+		fmt.Printf("Failed to create request: %v\n", err)
 		return
 	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	respMessages, err := bot.SendMediaGroup(tgbotapi.NewMediaGroup(chatID, mediaFiles))
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
 
 	currentTimeStr := time.Now().Format("2006-01-02 15:04:05")
-	fileListStr := strings.Join(processedFiles, ", ")
-	respJSON, _ := json.Marshal(respMessages)
+	fileListStr := strings.Join(validFiles, ", ")
 
 	if err != nil {
-		fmt.Printf("\nFailed to send media group: %v\n", err)
-		if strings.Contains(err.Error(), "PHOTO_INVALID_DIMENSIONS") {
-			fmt.Println("⚠️ Detected PHOTO_INVALID_DIMENSIONS. Retrying upload by degrading all items to Safe Document Mode...")
-			retryMediaFiles := make([]interface{}, len(processedFiles))
-			isFirstRetryItem := true
-			for idx, file := range processedFiles {
-				reqFile := getProgressRequestFile(file)
-				docMedia := tgbotapi.NewInputMediaDocument(reqFile)
-				if isFirstRetryItem && globalCaption != "" {
-					docMedia.Caption = globalCaption
-					isFirstRetryItem = false
-				}
-				retryMediaFiles[idx] = docMedia
-			}
-
-			retryResp, retryErr := bot.SendMediaGroup(tgbotapi.NewMediaGroup(chatID, retryMediaFiles))
-			retryJSON, _ := json.Marshal(retryResp)
-
-			if retryErr != nil {
-				fmt.Printf("Fallback failed: %v\n", retryErr)
-				errLogContent := fmt.Sprintf("[%s] ERROR: %v | Fallback JSON: %s | Files: [%s]\n", currentTimeStr, retryErr, string(retryJSON), fileListStr)
-				writeLog(logDir, "error.log", errLogContent)
-				return
-			} else {
-				fmt.Println("Fallback upload success via Document Mode.")
-				okLogContent := fmt.Sprintf("[%s] SUCCESS (FALLBACK): MsgIDs: %s | Files: [%s]\n", currentTimeStr, string(retryJSON), fileListStr)
-				writeLog(logDir, "ok.log", okLogContent)
-				return
-			}
-		}
-
-		errLogContent := fmt.Sprintf("[%s] ERROR: %v | Response JSON: %s | Files attempted: [%s]\n", currentTimeStr, err, string(respJSON), fileListStr)
+		errLogContent := fmt.Sprintf("[%s] ERROR: %v | Files attempted: [%s]\n", currentTimeStr, err, fileListStr)
 		writeLog(logDir, "error.log", errLogContent)
-	} else {
-		fmt.Println("\nBatch upload success.")
-		okLogContent := fmt.Sprintf("[%s] SUCCESS: Response JSON: %s | Files uploaded: [%s]\n", currentTimeStr, string(respJSON), fileListStr)
+		fmt.Printf("Upload request failed: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		fmt.Println("Batch upload success.")
+		okLogContent := fmt.Sprintf("[%s] SUCCESS: Status: %d | Files uploaded: [%s]\n", currentTimeStr, resp.StatusCode, fileListStr)
 		writeLog(logDir, "ok.log", okLogContent)
+	} else {
+		fmt.Printf("\nTelegram API Error: Status %d, Body: %s\n", resp.StatusCode, string(respBody))
+		errLogContent := fmt.Sprintf("[%s] ERROR: Status %d | Body: %s | Files attempted: [%s]\n", currentTimeStr, resp.StatusCode, string(respBody), fileListStr)
+		writeLog(logDir, "error.log", errLogContent)
 	}
 }
 
-func getProgressRequestFile(path string) tgbotapi.RequestFileData {
-	file, err := os.Open(path)
+func addFileToMultipart(writer *multipart.Writer, fieldName string, filePath string, showProgress bool) {
+	part, err := writer.CreateFormFile(fieldName, filepath.Base(filePath))
 	if err != nil {
-		return tgbotapi.FilePath(path)
+		return
 	}
 
-	fi, err := file.Stat()
+	file, err := os.Open(filePath)
 	if err != nil {
-		return tgbotapi.FilePath(path)
+		return
 	}
+	defer file.Close()
 
-	bar := progressbar.NewOptions64(
-		fi.Size(),
-		progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", filepath.Base(path))),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionThrottle(65),
-		progressbar.OptionShowCount(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(os.Stderr, "\n")
-		}),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionFullWidth(),
-	)
-
-	proxyReader := progressbar.NewReader(file, bar)
-
-	return tgbotapi.FileReader{
-		Name:   filepath.Base(path),
-		Reader: &proxyReader,
+	if showProgress {
+		fi, _ := file.Stat()
+		bar := progressbar.NewOptions64(
+			fi.Size(),
+			progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", filepath.Base(filePath))),
+			progressbar.OptionSetWriter(os.Stderr),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetWidth(15),
+			progressbar.OptionThrottle(65),
+			progressbar.OptionShowCount(),
+			progressbar.OptionOnCompletion(func() {
+				fmt.Fprint(os.Stderr, "\n")
+			}),
+			progressbar.OptionSpinnerType(14),
+			progressbar.OptionFullWidth(),
+		)
+		proxyReader := progressbar.NewReader(file, bar)
+		_, _ = io.Copy(part, &proxyReader)
+	} else {
+		_, _ = io.Copy(part, file)
 	}
 }
 
@@ -634,7 +668,6 @@ func getVideoMeta(videoPath string) (width int, height int, duration int, err er
 	return width, height, duration, nil
 }
 
-// generateThumbnail 完美贴合 Telegram 标准：长边不超过 320px、高品质 JPG、移除会引发 234 错误的无效参数
 func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path string, isPortrait bool, err error) {
 	hasherName := sha1.New()
 	hasherName.Write([]byte(videoPath))
@@ -647,7 +680,6 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 		if fi, err := os.Stat(finalThumbPath); err == nil {
 			if fi.Size() > 10 {
 				tW, tH := getImageDimensions(finalThumbPath)
-				// 根据最新知识库限制：严格约束缓存图片的宽高均不得超过 320
 				if tW > 0 && tH > 0 && tW <= 320 && tH <= 320 {
 					isCacheValid = true
 					if tH > tW {
@@ -667,19 +699,16 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
 
-	// 【致命错误修复区】：彻底抛弃 `-vf autorotate=1` 等破坏命令行的参数！
-	// 新版 FFmpeg 原生默认携带画面自动旋转解码。这里只用最纯净的命令在第 1 秒抽取单帧，保证稳定输出0退出码。
+	// 只截取第 1 秒的原帧大图，没有任何冗余滤镜干扰
 	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", rawTempJpg)
 	if err := cmd.Run(); err != nil {
-		// 备用降级方案，应对小于 1 秒的超短视频
 		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
 		if errFallback := cmdFallback.Run(); errFallback != nil {
-			return "", false, fmt.Errorf("ffmpeg raw frame extraction failed: %v", errFallback)
+			return "", false, errFallback
 		}
 	}
 	defer os.Remove(rawTempJpg)
 
-	// 使用 Go 原生图片库安全无损缩放，长边严格锁定为最高 320px
 	rawFile, err := os.Open(rawTempJpg)
 	if err != nil {
 		return "", false, err
@@ -695,7 +724,7 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	srcW := bounds.Dx()
 	srcH := bounds.Dy()
 
-	// 严格设定为 320 像素上限
+	// 严格执行 320px 知识库限制
 	maxSize := 320
 	var newW, newHeight int
 	if srcW > srcH {
@@ -724,7 +753,6 @@ func generateThumbnail(videoPath string, cacheDir string, cacheForce bool) (path
 	}
 	defer outFile.Close()
 
-	// 使用品质 92 的 JPEG 编码，对于 320x320 尺寸的文件体积将绝对稳压在几十 KB（远低于 200KB 要求）
 	err = jpeg.Encode(outFile, dstImg, &jpeg.Options{Quality: 92})
 	if err != nil {
 		return "", false, err
