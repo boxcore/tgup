@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -31,11 +32,14 @@ import (
 
 // Config 存储配置文件信息
 type Config struct {
-	ChatID    int64
-	BotAPI    string
-	TgAPIURL  string
-	PhotoExts []string
-	VideoExts []string
+	ChatID        int64
+	BotAPI        string
+	TgAPIURL      string
+	PhotoExts     []string
+	VideoExts     []string
+	AllowSpilFile bool    // ALLOW_SPIL_FILE：是否允许大视频切片
+	AllowMaxSize  int64   // ALLOW_MAX_SIZE：允许读取/切片的最大视频尺寸
+	SpilMaxSize   float64 // SPIL_MAX_SIZE：单片切片容量上限（单位GB，如1.5）
 }
 
 // VideoMetaCache 用于本地强缓存 WebDAV 视频的元数据，避免重复 ffprobe
@@ -85,7 +89,7 @@ func main() {
 			flagArgs = append(flagArgs, arg)
 			if !strings.Contains(arg, "=") {
 				flagName := strings.TrimLeft(arg, "-")
-				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" || flagName == "sort" {
+				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" || flagName == "sort" || flagName == "spil" {
 					if i+1 < len(os.Args) {
 						flagArgs = append(flagArgs, os.Args[i+1])
 						i++
@@ -107,6 +111,7 @@ func main() {
 	var sleepDurationFlag int
 	var transcodeFlag bool
 	var sortFlag string
+	var spilFlag bool // 👈 新增命令参数：强制激活开启大视频切片能力
 
 	flag.StringVar(&titleFlag, "title", "", "Specify a global caption title for the media group")
 	flag.StringVar(&testFlag, "t", "", "Test mode: use '-t=curl' to print curl command, '-t=list' to show files")
@@ -119,6 +124,7 @@ func main() {
 	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration in seconds between batch uploads")
 	flag.BoolVar(&transcodeFlag, "transcode", false, "Enable on-the-fly FFmpeg transcoding for non-standard videos")
 	flag.StringVar(&sortFlag, "sort", "name", "Sort files by: name, mod, create, size, size_desc")
+	flag.BoolVar(&spilFlag, "spil", false, "Force enable on-the-fly video splitting for files > 2GB")
 
 	// 2. 官方标准解析
 	flag.Parse()
@@ -127,7 +133,7 @@ func main() {
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
 		fmt.Println("Error: Please specify a file or directory path.")
-		fmt.Println("Usage: go run main.go [-n=10] [-type=video] [--transcode] [--sort=name] [-s=5] <path>")
+		fmt.Println("Usage: go run main.go [-n=10] [-type=video] [--transcode] [--spil] [--sort=name] <path>")
 		os.Exit(1)
 	}
 	targetPath := tailArgs[0]
@@ -162,6 +168,11 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error loading config from %s: %v\n", configPath, err)
 		os.Exit(1)
+	}
+
+	// 如果命令行指定了 --spil，强制覆盖配置文件将切片开关设为 true
+	if spilFlag {
+		config.AllowSpilFile = true
 	}
 
 	// 6. 解析目标路径获取文件列表
@@ -221,8 +232,7 @@ func main() {
 			mTimeStr := "--"
 
 			if err == nil {
-				sizeStr = fmt.Sprintf("%.2f MB", float64(fi.Size())/1024.0/1024.0)
-
+				sizeStr = formatSize(fi.Size())
 				mTime := fi.ModTime()
 				cTime := mTime
 
@@ -241,7 +251,6 @@ func main() {
 					}
 				}
 
-				// 💡 【核心修改点】：引入 4 位标准年份
 				cTimeStr = cTime.Format("2006-01-02 15:04")
 				mTimeStr = mTime.Format("2006-01-02 15:04")
 			}
@@ -285,41 +294,192 @@ func main() {
 		bot.Debug = false
 	}
 
-	// 9. 动态分批处理
-	for i := 0; i < len(files); i += batchSizeFlag {
-		end := i + batchSizeFlag
-		if end > len(files) {
-			end = len(files)
-		}
-		batch := files[i:end]
+	// 9. 🚀 【核心动态分批排队调度内核】：完美支持遇到超大视频时前置 Flush 刷新
+	var currentBatch []string
+	for _, file := range files {
+		ext := strings.ToLower(filepath.Ext(file))
+		fi, err := os.Stat(file)
 
-		if finalTestMode != "curl" {
-			fmt.Printf("⚡ 正在有序预处理当前批次 (%d/%d) 的 WebDAV 缓存...\n", i+1, end)
-			for _, file := range batch {
-				ext := strings.ToLower(filepath.Ext(file))
-				if contains(config.VideoExts, ext) {
-					_, _, _, _, _, _ = getVideoDataUnified(file, cacheDir, cacheForceFlag)
-					time.Sleep(600 * time.Millisecond)
+		isLargeVideo := false
+		// 判定单个视频是否突破机器人原生 2.0 GB 的物理拦截线
+		if err == nil && contains(config.VideoExts, ext) && fi.Size() > 2000*1024*1024 {
+			isLargeVideo = true
+		}
+
+		if isLargeVideo {
+			// 如果没被允许切片，直接跳过处理
+			if !config.AllowSpilFile {
+				fmt.Printf("⚠️ 跳过大视频文件 (未激活切片开关 ALLOW_SPIL_FILE): %s (%s)\n", filepath.Base(file), formatSize(fi.Size()))
+				continue
+			}
+			// 如果超出了最大限制常量，抛出提醒并继续跳过
+			if fi.Size() > config.AllowMaxSize {
+				fmt.Printf("❌ 超过最大文件尺寸限制 (ALLOW_MAX_SIZE: %s)，强制跳过该大文件: %s (%s)\n", formatSize(config.AllowMaxSize), filepath.Base(file), formatSize(fi.Size()))
+				continue
+			}
+
+			// 🔥 核心策略：遇到需要切片的视频，必须先将前面分组积攒的常规批次内容全部上传清空
+			if len(currentBatch) > 0 {
+				fmt.Printf("\n⚡ 发现超大视频，正在前置强制性上传当前已积攒的普通批次群组 (包含 %d 个文件)...\n", len(currentBatch))
+				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+				currentBatch = nil
+				if sleepDurationFlag > 0 {
+					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
+				}
+			}
+
+			// 单独开启超级大视频的流式下载、秒切与独立投递
+			fmt.Printf("\n🎬 准备就绪，开始对超大视频执行无损流拷贝切片上传调度: %s (%s)\n", filepath.Base(file), formatSize(fi.Size()))
+			handleSplitVideoUpload(bot, config, file, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+
+			if sleepDurationFlag > 0 {
+				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
+			}
+		} else {
+			// 普通小媒体继续无缝积攒队列
+			currentBatch = append(currentBatch, file)
+			if len(currentBatch) == batchSizeFlag {
+				fmt.Printf("\n--- Preparing batch: 满 %d 个普通多媒体包，发起正常投递 ---\n", batchSizeFlag)
+				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+				currentBatch = nil
+				if sleepDurationFlag > 0 {
+					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 				}
 			}
 		}
+	}
 
-		if finalTestMode == "curl" {
-			generateCurlCommand(config, batch, globalCaption, cacheDir, cacheForceFlag)
-		} else {
-			fmt.Printf("\n--- Preparing batch: %d to %d (Total: %d) ---\n", i+1, end, len(files))
-			uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag, transcodeFlag)
-
-			if end < len(files) && sleepDurationFlag > 0 {
-				fmt.Printf("🛋️ 批次发送完毕，主动进入 %d 秒战略冷却...\n", sleepDurationFlag)
-				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
-			}
-		}
+	// 最终收尾可能还剩一些残存普通文件
+	if len(currentBatch) > 0 {
+		fmt.Printf("\n--- Preparing batch: 上传最后一批剩余残留文件 (包含 %d 个文件) ---\n", len(currentBatch))
+		preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
 	}
 
 	if finalTestMode != "curl" {
 		fmt.Println("\nAll uploads completed successfully!")
 	}
+}
+
+// preProcessAndUpload 封装的有序网盘预探测探测与相册投递总调度
+func preProcessAndUpload(bot *tgbotapi.BotAPI, config *Config, batch []string, cacheDir string, cacheForceFlag bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string) {
+	if finalTestMode != "curl" {
+		for _, f := range batch {
+			ext := strings.ToLower(filepath.Ext(f))
+			if contains(config.VideoExts, ext) {
+				_, _, _, _, _, _ = getVideoDataUnified(f, cacheDir, cacheForceFlag)
+				time.Sleep(600 * time.Millisecond)
+			}
+		}
+	}
+	if finalTestMode == "curl" {
+		generateCurlCommand(config, batch, globalCaption, cacheDir, cacheForceFlag)
+	} else {
+		uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag, transcodeFlag)
+	}
+}
+
+// handleSplitVideoUpload 大视频秒切不落盘清理总内核
+func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, cacheDir string, cacheForce bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string) {
+	ext := strings.ToLower(filepath.Ext(origPath))
+
+	fmt.Println("⏳ 正在从网盘流式拉取数据到本地 Cache，并同步高速计算 SHA1 校验和...")
+	src, err := os.Open(origPath)
+	if err != nil {
+		fmt.Printf("❌ 无法读取网盘源文件路径: %v\n", err)
+		return
+	}
+	defer src.Close()
+
+	hasher := sha1.New()
+	tmpFile, err := os.CreateTemp(cacheDir, "tgup_org_download_")
+	if err != nil {
+		fmt.Printf("❌ 无法创建本地高速缓冲临时文件: %v\n", err)
+		return
+	}
+	defer os.Remove(tmpFile.Name())
+
+	fi, _ := src.Stat()
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetDescription("[本地快速缓存中]"),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(15),
+		progressbar.OptionThrottle(65),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+	)
+
+	// 双写流：一边流式写入临时文件，一边源源不断计算 Hash
+	mw := io.MultiWriter(tmpFile, hasher, bar)
+	_, err = io.Copy(mw, src)
+	tmpFile.Close()
+	if err != nil {
+		fmt.Printf("❌ 视频大文件拉取落盘本地缓存失败: %v\n", err)
+		return
+	}
+
+	hashStr := hex.EncodeToString(hasher.Sum(nil))
+	localOrgName := fmt.Sprintf("org_%s%s", hashStr, ext)
+	localOrgPath := filepath.Join(cacheDir, localOrgName)
+
+	_ = os.Remove(localOrgPath)
+	if err := os.Rename(tmpFile.Name(), localOrgPath); err != nil {
+		fmt.Printf("❌ 修正规范原始文件名失败: %v\n", err)
+		return
+	}
+
+	// 根据常量配置换算切片尺寸
+	sizeInMB := int(cfg.SpilMaxSize * 1024)
+	segmentSizeStr := fmt.Sprintf("%dM", sizeInMB)
+	outputPattern := filepath.Join(cacheDir, fmt.Sprintf("split_%s_%%03d%s", hashStr, ext))
+
+	fmt.Printf("⚙️ 正在调用 FFmpeg 启动秒级无损流拷贝切割 (单片设定上限: %s)...\n", segmentSizeStr)
+	cmd := exec.Command("ffmpeg", "-y", "-i", localOrgPath,
+		"-c", "copy", "-map", "0",
+		"-f", "segment", "-segment_size", segmentSizeStr,
+		"-reset_timestamps", "1",
+		outputPattern,
+	)
+
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("❌ FFmpeg 无损分段切片失败: %v, 详情: %s\n", err, errBuf.String())
+		return
+	}
+
+	// 顺序捕获所有生成的分段切片文件
+	globPattern := filepath.Join(cacheDir, fmt.Sprintf("split_%s_*%s", hashStr, ext))
+	splitPieces, err := filepath.Glob(globPattern)
+	if err != nil || len(splitPieces) == 0 {
+		fmt.Println("❌ 未检测到任何切片产生的视频碎片文件。")
+		return
+	}
+
+	// 进行自然数字升级排序，确保相册内的顺序不变
+	sort.Slice(splitPieces, func(i, j int) bool {
+		return isLessNatural(splitPieces[i], splitPieces[j])
+	})
+
+	fmt.Printf("📦 切片处理大功告成！共裂变生成 %d 个合格的分段短视频，开始作为独立相册投递...\n", len(splitPieces))
+	preProcessAndUpload(bot, cfg, splitPieces, cacheDir, cacheForce, globalCaption, logDir, transcodeFlag, finalTestMode)
+
+	// 🧹 上传成功结束后的善后打扫：视频缓存大文件必须全部抹去，仅安全存留文件最原始的 JSON 本地强缓存数据
+	fmt.Println("🧹 上传动作结束，开始全自动深度洗刷本地大体积视频缓存...")
+	_ = os.Remove(localOrgPath) // 销毁 org_ 视频
+	for _, piece := range splitPieces {
+		_ = os.Remove(piece) // 销毁各个分段 split_ 视频
+
+		// 顺带清理掉切片视频探测临时产生的 .jpg 缩略图封面图以彻底保护空间，而原始 .json 强缓存绝不被破坏
+		hasherName := sha1.New()
+		hasherName.Write([]byte(piece))
+		token := hex.EncodeToString(hasherName.Sum(nil))
+		_ = os.Remove(filepath.Join(cacheDir, token+".jpg"))
+	}
+	fmt.Println("✨ 本地大视频及分片缓存深度洗刷完毕，空间已完美释放！")
 }
 
 func checkAndResizePhoto(photoPath string, cacheDir string, cacheForce bool) (string, error) {
@@ -505,6 +665,7 @@ func writeLog(logDir string, filename string, content string) {
 	_, _ = f.WriteString(content)
 }
 
+// loadConfig 高精防呆版：解析并赋予 ALLOW_SPIL_FILE / ALLOW_MAX_SIZE / SPIL_MAX_SIZE 的默认常量值
 func loadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -513,8 +674,11 @@ func loadConfig(path string) (*Config, error) {
 	defer file.Close()
 
 	cfg := &Config{
-		PhotoExts: []string{".jpg", ".jpeg", ".png"},
-		VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
+		PhotoExts:     []string{".jpg", ".jpeg", ".png"},
+		VideoExts:     []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
+		AllowSpilFile: false,                   // 默认不切片
+		AllowMaxSize:  10 * 1024 * 1024 * 1024, // 默认最大允许 10GB 保底
+		SpilMaxSize:   1.5,                     // 默认切片每份 1.5GB
 	}
 
 	scanner := bufio.NewScanner(file)
@@ -538,6 +702,29 @@ func loadConfig(path string) (*Config, error) {
 			cfg.BotAPI = val
 		case "TG_API_URL":
 			cfg.TgAPIURL = val
+		case "ALLOW_SPIL_FILE":
+			cfg.AllowSpilFile = strings.ToLower(val) == "true"
+		case "ALLOW_MAX_SIZE":
+			valLower := strings.ToLower(val)
+			if strings.HasSuffix(valLower, "g") {
+				numStr := strings.TrimSuffix(valLower, "g")
+				if g, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					cfg.AllowMaxSize = g * 1024 * 1024 * 1024
+				}
+			} else if strings.HasSuffix(valLower, "m") {
+				numStr := strings.TrimSuffix(valLower, "m")
+				if m, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					cfg.AllowMaxSize = m * 1024 * 1024
+				}
+			} else {
+				if bytesVal, err := strconv.ParseInt(val, 10, 64); err == nil {
+					cfg.AllowMaxSize = bytesVal
+				}
+			}
+		case "SPIL_MAX_SIZE":
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				cfg.SpilMaxSize = f
+			}
 		case "PHOTO_EXTS":
 			exts := strings.Split(strings.ToLower(val), ",")
 			var cleanExts []string
@@ -573,7 +760,6 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, scanner.Err()
 }
 
-// collectFiles 跨平台无损升级版：利用反射机制完美兼容 Mac 和 Linux 的底层 ctime 读取，外加大小双向排序
 func collectFiles(targetPath string, sortType string) ([]string, error) {
 	fi, err := os.Stat(targetPath)
 	if err != nil {
@@ -651,7 +837,6 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 	return sortedFiles, nil
 }
 
-// uploadMediaGroup 自适应流式控流版：集成 io.Pipe、2核VPS降维转码、高精渐进式退避频控自愈机制
 func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool, transcodeFlag bool) {
 	var mediaJSONArray []TgMediaItem
 	var payloads []FilePayload
@@ -1053,4 +1238,17 @@ func isLessNatural(a, b string) bool {
 
 func isDigit(b byte) bool {
 	return b >= '0' && b <= '9'
+}
+
+func formatSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.2f KB", float64(bytes)/1024.0)
+	}
+	if bytes < 1024*1024*1024 {
+		return fmt.Sprintf("%.2f MB", float64(bytes)/1024.0/1024.0)
+	}
+	return fmt.Sprintf("%.2f GB", float64(bytes)/1024.0/1024.0/1024.0)
 }
