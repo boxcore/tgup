@@ -31,53 +31,62 @@ import (
 )
 
 type Config struct {
-	ChatID        int64
-	BotAPI        string
-	TgAPIURL      string
-	PhotoExts     []string
-	VideoExts     []string
-	AllowSpilFile bool
-	AllowMaxSize  int64
-	SpilMaxSize   float64
+	ChatID        int64    `json:"chat_id"`
+	BotAPI        string   `json:"bot_api"`
+	TgAPIURL      string   `json:"tg_api_url"`
+	PhotoExts     []string `json:"photo_exts"`
+	VideoExts     []string `json:"video_exts"`
+	AllowSpilFile bool     `json:"allow_spil_file"`
+	AllowMaxSize  int64    `json:"allow_max_size"`
+	SpilMaxSize   float64  `json:"spil_max_size"`
 }
 
 type VideoMetaCache struct {
-	Width, Height, Duration int
-	IsPortrait              bool `json:"is_portrait"`
+	Width      int  `json:"width"`
+	Height     int  `json:"height"`
+	Duration   int  `json:"duration"`
+	IsPortrait bool `json:"is_portrait"`
 }
 
 type OrgVideoCache struct {
 	OrigFilename   string `json:"orig_filename"`
 	Size           int64  `json:"size"`
-	Width, Height  int
+	Width          int    `json:"width"`
+	Height         int    `json:"height"`
 	Duration       int    `json:"duration"`
 	LocalCachePath string `json:"local_cache_path"`
 	Uploaded       bool   `json:"uploaded"`
 }
 
 type FilePayload struct {
-	FieldKey, FilePath string
-	ShowProgress       bool
-	NeedTranscode      bool
+	FieldKey      string `json:"field_key"`
+	FilePath      string `json:"file_path"`
+	ShowProgress  bool   `json:"show_progress"`
+	NeedTranscode bool   `json:"need_transcode"`
 }
 
+// TgMediaItem 🟢 彻底修复：严格独立分行，绝不混用 Tag 占位
 type TgMediaItem struct {
-	Type, Media       string `json:"type"`
+	Type              string `json:"type"`
+	Media             string `json:"media"`
 	Caption           string `json:"caption,omitempty"`
-	Width, Height     int    `json:"width,omitempty"`
+	Width             int    `json:"width,omitempty"`
+	Height            int    `json:"height,omitempty"`
 	Duration          int    `json:"duration,omitempty"`
 	SupportsStreaming bool   `json:"supports_streaming,omitempty"`
 	Thumb             string `json:"thumb,omitempty"`
 }
 
 type fileSortItem struct {
-	path             string
-	modTime, creTime time.Time
-	size             int64
+	path    string
+	modTime time.Time
+	creTime time.Time
+	size    int64
 }
 
 func main() {
-	var flagArgs, positionalArgs []string
+	var flagArgs []string
+	var positionalArgs []string
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		if strings.HasPrefix(arg, "-") {
@@ -204,7 +213,8 @@ func main() {
 						statField = v.FieldByName("Ctimespec")
 					}
 					if statField.IsValid() {
-						secField, nsecField := statField.FieldByName("Sec"), statField.FieldByName("Nsec")
+						secField := statField.FieldByName("Sec")
+						nsecField := statField.FieldByName("Nsec")
 						if secField.IsValid() && nsecField.IsValid() {
 							cTime = time.Unix(secField.Int(), nsecField.Int())
 						}
@@ -810,7 +820,6 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 						}
 						bar := progressbar.NewOptions64(fi.Size(), progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", descStr)), progressbar.OptionSetWriter(os.Stderr), progressbar.OptionShowBytes(true), progressbar.OptionSetWidth(15), progressbar.OptionThrottle(65), progressbar.OptionShowCount(), progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }), progressbar.OptionSpinnerType(14), progressbar.OptionFullWidth())
 
-						// 🚀 【完美修复点】：提取为实例并使用指针引用，杜绝接口未实现实现编译障碍
 						proxyReader := progressbar.NewReader(file, bar)
 						_, _ = io.Copy(part, &proxyReader)
 					} else {
