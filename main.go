@@ -42,57 +42,49 @@ type Config struct {
 }
 
 type VideoMetaCache struct {
-	Width      int  `json:"width"`
-	Height     int  `json:"height"`
-	Duration   int  `json:"duration"`
-	IsPortrait bool `json:"is_portrait"`
+	Width, Height, Duration int
+	IsPortrait              bool `json:"is_portrait"`
 }
 
 type OrgVideoCache struct {
 	OrigFilename   string `json:"orig_filename"`
 	Size           int64  `json:"size"`
-	Width          int    `json:"width"`
-	Height         int    `json:"height"`
+	Width, Height  int
 	Duration       int    `json:"duration"`
 	LocalCachePath string `json:"local_cache_path"`
 	Uploaded       bool   `json:"uploaded"`
 }
 
 type FilePayload struct {
-	FieldKey      string
-	FilePath      string
-	ShowProgress  bool
-	NeedTranscode bool
+	FieldKey, FilePath string
+	ShowProgress       bool
+	NeedTranscode      bool
 }
 
 type TgMediaItem struct {
-	Type              string `json:"type"`
-	Media             string `json:"media"`
+	Type, Media       string `json:"type"`
 	Caption           string `json:"caption,omitempty"`
-	Width             int    `json:"width,omitempty"`
-	Height            int    `json:"height,omitempty"`
+	Width, Height     int    `json:"width,omitempty"`
 	Duration          int    `json:"duration,omitempty"`
 	SupportsStreaming bool   `json:"supports_streaming,omitempty"`
 	Thumb             string `json:"thumb,omitempty"`
 }
 
 type fileSortItem struct {
-	path    string
-	modTime time.Time
-	creTime time.Time
-	size    int64
+	path             string
+	modTime, creTime time.Time
+	size             int64
 }
 
 func main() {
-	var flagArgs []string
-	var positionalArgs []string
+	var flagArgs, positionalArgs []string
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		if strings.HasPrefix(arg, "-") {
 			flagArgs = append(flagArgs, arg)
 			if !strings.Contains(arg, "=") {
-				flagName := strings.TrimLeft(arg, "-")
-				if flagName == "title" || flagName == "t" || flagName == "test" || flagName == "type" || flagName == "n" || flagName == "s" || flagName == "sort" || flagName == "spil" {
+				fName := strings.TrimLeft(arg, "-")
+				if fName == "title" || fName == "t" || fName == "test" || fName == "type" || fName == "n" || fName == "s" || fName == "sort" || fName == "spil" {
 					if i+1 < len(os.Args) {
 						flagArgs = append(flagArgs, os.Args[i+1])
 						i++
@@ -145,8 +137,7 @@ func main() {
 		os.Exit(1)
 	}
 	baseDir := filepath.Join(homeDir, ".tgup")
-	cacheDir := filepath.Join(baseDir, "cache")
-	logDir := filepath.Join(baseDir, "logs")
+	cacheDir, logDir := filepath.Join(baseDir, "cache"), filepath.Join(baseDir, "logs")
 	_ = os.MkdirAll(cacheDir, 0755)
 	_ = os.MkdirAll(logDir, 0755)
 
@@ -167,15 +158,13 @@ func main() {
 	typeFilterFlag = strings.ToLower(strings.TrimSpace(typeFilterFlag))
 	for _, file := range rawFiles {
 		ext := strings.ToLower(filepath.Ext(file))
-		isPhoto := contains(config.PhotoExts, ext)
-		isVideo := contains(config.VideoExts, ext)
-
+		isPhoto, isVideo := contains(config.PhotoExts, ext), contains(config.VideoExts, ext)
 		if typeFilterFlag != "all" && typeFilterFlag != "pic" && typeFilterFlag != "video" && typeFilterFlag != "vedio" {
-			targetExt := typeFilterFlag
-			if !strings.HasPrefix(targetExt, ".") {
-				targetExt = "." + targetExt
+			tExt := typeFilterFlag
+			if !strings.HasPrefix(tExt, ".") {
+				tExt = "." + tExt
 			}
-			if ext != targetExt {
+			if ext != tExt {
 				continue
 			}
 		} else {
@@ -215,15 +204,13 @@ func main() {
 						statField = v.FieldByName("Ctimespec")
 					}
 					if statField.IsValid() {
-						secField := statField.FieldByName("Sec")
-						nsecField := statField.FieldByName("Nsec")
+						secField, nsecField := statField.FieldByName("Sec"), statField.FieldByName("Nsec")
 						if secField.IsValid() && nsecField.IsValid() {
 							cTime = time.Unix(secField.Int(), nsecField.Int())
 						}
 					}
 				}
-				cTimeStr = cTime.Format("2006-01-02 15:04")
-				mTimeStr = mTime.Format("2006-01-02 15:04")
+				cTimeStr, mTimeStr = cTime.Format("2006-01-02 15:04"), mTime.Format("2006-01-02 15:04")
 			}
 			fmt.Printf("[%03d] %s (%s | C:%s M:%s)\n", idx+1, filepath.Base(file), sizeStr, cTimeStr, mTimeStr)
 			if (idx+1)%batchSizeFlag == 0 || (idx+1) == len(files) {
@@ -255,10 +242,16 @@ func main() {
 	}
 
 	var currentBatch []string
+	var currentBatchSize int64 = 0
+
 	for _, file := range files {
 		ext := strings.ToLower(filepath.Ext(file))
 		fi, err := os.Stat(file)
-		isLargeVideo := err == nil && contains(config.VideoExts, ext) && fi.Size() > 2000*1024*1024
+		if err != nil {
+			continue
+		}
+
+		isLargeVideo := contains(config.VideoExts, ext) && fi.Size() > 2000*1024*1024
 
 		if isLargeVideo {
 			if !config.AllowSpilFile {
@@ -272,19 +265,34 @@ func main() {
 			if len(currentBatch) > 0 {
 				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
 				currentBatch = nil
+				currentBatchSize = 0
 				if sleepDurationFlag > 0 {
 					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 				}
 			}
-			handleSplitVideoUpload(bot, config, file, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+			handleSplitVideoUpload(bot, config, file, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode, batchSizeFlag, sleepDurationFlag)
 			if sleepDurationFlag > 0 {
 				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
 		} else {
-			currentBatch = append(currentBatch, file)
-			if len(currentBatch) == batchSizeFlag {
+			if len(currentBatch) > 0 && (currentBatchSize+fi.Size()) > 2000*1024*1024 {
+				fmt.Printf("\n📦 [容量熔断保护] 当前群组总体积将超过 2GB 阈值，前置强行投递已积攒的 %d 个文件...\n", len(currentBatch))
 				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
 				currentBatch = nil
+				currentBatchSize = 0
+				if sleepDurationFlag > 0 {
+					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
+				}
+			}
+
+			currentBatch = append(currentBatch, file)
+			currentBatchSize += fi.Size()
+
+			if len(currentBatch) == batchSizeFlag {
+				fmt.Printf("\n--- Preparing batch: 满 %d 个多媒体包，发起正常投递 ---\n", batchSizeFlag)
+				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+				currentBatch = nil
+				currentBatchSize = 0
 				if sleepDurationFlag > 0 {
 					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 				}
@@ -315,7 +323,7 @@ func preProcessAndUpload(bot *tgbotapi.BotAPI, config *Config, batch []string, c
 	}
 }
 
-func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, cacheDir string, cacheForce bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string) {
+func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, cacheDir string, cacheForce bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string, batchSize int, sleepDuration int) {
 	ext := strings.ToLower(filepath.Ext(origPath))
 	baseName := filepath.Base(origPath)
 	fi, err := os.Stat(origPath)
@@ -336,7 +344,7 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 		if jsonBytes, err := os.ReadFile(jsonPath); err == nil {
 			if json.Unmarshal(jsonBytes, &cacheData) == nil {
 				if cacheData.Uploaded {
-					fmt.Printf("🎉 [元数据强缓存命中] 该超大视频已成功投递，跳过！\n文件：%s\n", baseName)
+					fmt.Printf("🎉 [元数据强缓存命中] 该超大视频已成功投递完毕，直接跳过！\n文件：%s\n", baseName)
 					return
 				}
 				if fiLocal, errFile := os.Stat(cacheData.LocalCachePath); errFile == nil && fiLocal.Size() == fi.Size() {
@@ -355,7 +363,6 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 			return
 		}
 		defer src.Close()
-
 		tmpFile, err := os.CreateTemp(cacheDir, "tgup_org_download_")
 		if err != nil {
 			return
@@ -402,8 +409,22 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 	}
 
 	sort.Slice(splitPieces, func(i, j int) bool { return isLessNatural(splitPieces[i], splitPieces[j]) })
-	fmt.Printf("📦 切片大功告成！裂变生成 %d 个分段小视频，开始作为独立相册投递...\n", len(splitPieces))
-	preProcessAndUpload(bot, cfg, splitPieces, cacheDir, cacheForce, globalCaption, logDir, transcodeFlag, finalTestMode)
+	fmt.Printf("📦 切片大功告成！裂变生成 %d 个分段小视频，开始进入分批画廊队列...\n", len(splitPieces))
+
+	for k := 0; k < len(splitPieces); k += batchSize {
+		endK := k + batchSize
+		if endK > len(splitPieces) {
+			endK = len(splitPieces)
+		}
+		pieceBatch := splitPieces[k:endK]
+
+		fmt.Printf("🎬 正在投递大视频切片子集专辑 (%d-%d / 总数 %d)...\n", k+1, endK, len(splitPieces))
+		preProcessAndUpload(bot, cfg, pieceBatch, cacheDir, cacheForce, globalCaption, logDir, transcodeFlag, finalTestMode)
+
+		if endK < len(splitPieces) && sleepDuration > 0 {
+			time.Sleep(time.Duration(sleepDuration) * time.Second)
+		}
+	}
 
 	fmt.Println("🧹 上传结束，正在清刷本地大体积视频缓存大文件...")
 	_ = os.Remove(localOrgPath)
@@ -411,8 +432,7 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 		_ = os.Remove(piece)
 		hasherName := sha1.New()
 		hasherName.Write([]byte(piece))
-		pieceToken := hex.EncodeToString(hasherName.Sum(nil))
-		_ = os.Remove(filepath.Join(cacheDir, pieceToken+".jpg"))
+		_ = os.Remove(filepath.Join(cacheDir, hex.EncodeToString(hasherName.Sum(nil))+".jpg"))
 	}
 	cacheData.Uploaded = true
 	metaBytes, _ := json.MarshalIndent(cacheData, "", "  ")
@@ -576,7 +596,6 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	defer file.Close()
-
 	cfg := &Config{PhotoExts: []string{".jpg", ".jpeg", ".png"}, VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"}, AllowSpilFile: false, AllowMaxSize: 10 * 1024 * 1024 * 1024, SpilMaxSize: 1.5}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -647,7 +666,6 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 	if !fi.IsDir() {
 		return []string{targetPath}, nil
 	}
-
 	var items []fileSortItem
 	err = filepath.Walk(targetPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -666,8 +684,7 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 					statField = v.FieldByName("Ctimespec")
 				}
 				if statField.IsValid() {
-					secField := statField.FieldByName("Sec")
-					nsecField := statField.FieldByName("Nsec")
+					secField, nsecField := statField.FieldByName("Sec"), statField.FieldByName("Nsec")
 					if secField.IsValid() && nsecField.IsValid() {
 						cTime = time.Unix(secField.Int(), nsecField.Int())
 					}
@@ -694,7 +711,6 @@ func collectFiles(targetPath string, sortType string) ([]string, error) {
 	default:
 		sort.Slice(items, func(i, j int) bool { return isLessNatural(items[i].path, items[j].path) })
 	}
-
 	var sortedFiles []string
 	for _, item := range items {
 		sortedFiles = append(sortedFiles, item.path)
@@ -793,6 +809,8 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 							descStr = fmt.Sprintf("[重试-%d] %s", retry, descStr)
 						}
 						bar := progressbar.NewOptions64(fi.Size(), progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", descStr)), progressbar.OptionSetWriter(os.Stderr), progressbar.OptionShowBytes(true), progressbar.OptionSetWidth(15), progressbar.OptionThrottle(65), progressbar.OptionShowCount(), progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }), progressbar.OptionSpinnerType(14), progressbar.OptionFullWidth())
+
+						// 🚀 【完美修复点】：提取为实例并使用指针引用，杜绝接口未实现实现编译障碍
 						proxyReader := progressbar.NewReader(file, bar)
 						_, _ = io.Copy(part, &proxyReader)
 					} else {
@@ -814,6 +832,7 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 		fileListStr := strings.Join(files, ", ")
 
 		if err != nil {
+			fmt.Printf("❌ [网络传输失败] 连接遭服务器强行中断（多半单次发包体积超标）: %v\n", err)
 			writeLog(logDir, "error.log", fmt.Sprintf("[%s] ERROR: %v | Files: [%s]\n", currentTimeStr, err, fileListStr))
 			return
 		}
@@ -857,8 +876,7 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	hasherName := sha1.New()
 	hasherName.Write([]byte(videoPath))
 	token := hex.EncodeToString(hasherName.Sum(nil))
-	finalThumbPath := filepath.Join(cacheDir, token+".jpg")
-	finalMetaPath := filepath.Join(cacheDir, token+".json")
+	finalThumbPath, finalMetaPath := filepath.Join(cacheDir, token+".jpg"), filepath.Join(cacheDir, token+".json")
 
 	isCacheValid := false
 	var cachedMeta VideoMetaCache
@@ -911,7 +929,7 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	time.Sleep(400 * time.Millisecond)
 	rawTempJpg := filepath.Join(cacheDir, "raw_extracted_frame.jpg")
 	_ = os.Remove(rawTempJpg)
-	cmdImg := exec.Command("ffmpeg", "-y", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-q:v", "2", rawTempJpg)
+	cmdImg := exec.Command("ffmpeg", "-y", "-ss", "0", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
 	if err := cmdImg.Run(); err != nil {
 		cmdFallback := exec.Command("ffmpeg", "-y", "-i", videoPath, "-vframes", "1", "-q:v", "2", rawTempJpg)
 		_ = cmdFallback.Run()
@@ -960,7 +978,6 @@ func getVideoDataUnified(videoPath string, cacheDir string, cacheForce bool) (w,
 	return w, h, duration, finalThumbPath, isPortrait, nil
 }
 
-// 🚀 【完美补齐区】：最尾部核心工具方法函数集
 func contains(slice []string, val string) bool {
 	for _, item := range slice {
 		if strings.EqualFold(item, val) {
