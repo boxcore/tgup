@@ -4,6 +4,29 @@
 
 ---
 
+## 📦 编译与部署
+
+### 1. 初始化依赖与配置
+```bash
+# 自动整理项目依赖
+go mod tidy
+
+# 创建配置与日志缓存目录
+mkdir -pv ~/.tgup/{cache,logs}
+```
+
+### 2. 编译并安装
+```bash
+# 在项目根目录下，指定入口路径编译为可执行文件
+go build -o tgup ./cmd/tgup
+
+# 赋予执行权限并移入系统 bin 目录以便全局调用（可选）
+chmod +x tgup
+sudo mv tgup /usr/local/bin/
+```
+
+---
+
 ## 🛠️ 参数配置全景表
 
 ### 1. 命令行参数 (Flags)
