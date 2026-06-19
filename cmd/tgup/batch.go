@@ -91,14 +91,51 @@ func chunkBySizeAndCount(files []string, batchSize int, sizeThreshold int64) [][
 	}
 	flush()
 
-	if len(batches) >= 2 {
-		lastIdx := len(batches) - 1
-		if len(batches[lastIdx]) == 1 {
-			prevIdx := lastIdx - 1
-			prev := batches[prevIdx]
-			moved := prev[len(prev)-1]
-			batches[prevIdx] = prev[:len(prev)-1]
-			batches[lastIdx] = append([]string{moved}, batches[lastIdx]...)
+	for {
+		changed := false
+		var clean [][]string
+		for _, b := range batches {
+			if len(b) > 0 {
+				clean = append(clean, b)
+			}
+		}
+		batches = clean
+
+		if len(batches) < 2 {
+			break
+		}
+
+		for i := 0; i < len(batches); i++ {
+			if len(batches[i]) == 1 {
+				if i == 0 {
+					nextLen := len(batches[1])
+					if nextLen+1 <= batchSize {
+						batches[1] = append(batches[0], batches[1]...)
+						batches[0] = nil
+					} else {
+						moved := batches[1][0]
+						batches[1] = batches[1][1:]
+						batches[0] = append(batches[0], moved)
+					}
+					changed = true
+					break
+				} else {
+					prevLen := len(batches[i-1])
+					if prevLen+1 <= batchSize {
+						batches[i-1] = append(batches[i-1], batches[i]...)
+						batches[i] = nil
+					} else {
+						moved := batches[i-1][prevLen-1]
+						batches[i-1] = batches[i-1][:prevLen-1]
+						batches[i] = append([]string{moved}, batches[i]...)
+					}
+					changed = true
+					break
+				}
+			}
+		}
+		if !changed {
+			break
 		}
 	}
 	return batches

@@ -349,9 +349,15 @@ func checkVideoFiles(videoFiles []string, cacheDir string) {
 			fmt.Printf("[%d/%d] ⚠️ 写入缓存文件失败: %v\n", idx+1, len(videoFiles), err)
 		}
 
+		// Check if streamable for TG warning suffix
+		var warnSuffix string
+		if !isTGStreamableWithCodec(path, info.VideoCodec) {
+			warnSuffix = " ⚠️ [不支持TG流式点播]"
+		}
+
 		// Clean printable output
 		durationStr := fmt.Sprintf("%.2f 秒 (%02d:%02d)", durationVal, int(durationVal)/60, int(durationVal)%60)
-		fmt.Printf("[%d/%d] 🎬 检测视频: %s\n", idx+1, len(videoFiles), info.Filename)
+		fmt.Printf("[%d/%d] 🎬 检测视频: %s%s\n", idx+1, len(videoFiles), info.Filename, warnSuffix)
 		fmt.Printf("      路径: %s\n", info.FilePath)
 		fmt.Printf("      大小: %s\n", formatSize(info.Size))
 		fmt.Printf("      分辨率: %dx%d (高宽比: %s)\n", info.Width, info.Height, aspectStr)
@@ -376,4 +382,90 @@ func gcd(a, b int) int {
 		a, b = b, a%b
 	}
 	return a
+}
+
+func isTGStreamableWithCodec(filePath string, videoCodec string) bool {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext != ".mp4" && ext != ".m4v" {
+		return false
+	}
+	codec := strings.ToLower(videoCodec)
+	return codec == "h264" || codec == "hevc" || codec == "h265" || codec == "avc"
+}
+
+func isTGStreamable(filePath string) (bool, string) {
+	codec := getVideoCodec(filePath)
+	return isTGStreamableWithCodec(filePath, codec), codec
+}
+
+func getVideoCodec(videoPath string) string {
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1", videoPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, "=")
+		if len(parts) == 2 && parts[0] == "codec_name" {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
+}
+
+func filterUnsupportedVideos(files []string, config *Config, cacheDir string) []string {
+	var filtered []string
+	for _, file := range files {
+		ext := strings.ToLower(filepath.Ext(file))
+		if !contains(config.VideoExts, ext) {
+			// Keep non-videos (e.g. photos/documents)
+			filtered = append(filtered, file)
+			continue
+		}
+
+		streamable, codec := isTGStreamable(file)
+		if streamable {
+			filtered = append(filtered, file)
+			continue
+		}
+
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Printf("⚠️ 警告: 视频文件 [%s] (编码: %s) 在 Telegram 上不支持媒体流直接点播！\n", filepath.Base(file), codec)
+		fmt.Println("提示: 建议使用 --transcode 参数进行实时转码，或提前转换为 H.264 MP4 格式。")
+
+		prompt := fmt.Sprintf("❓ 是否坚持直接上传该文件？(y/n, 5秒内无输入默认跳过): ")
+		confirmed := askConfirmationWithTimeout(prompt, 5*time.Second)
+		if confirmed {
+			fmt.Println("✅ 已确认，将继续上传此视频。")
+			filtered = append(filtered, file)
+		} else {
+			fmt.Printf("🚫 已跳过不支持的视频文件: %s\n", filepath.Base(file))
+		}
+		fmt.Println(strings.Repeat("=", 60))
+	}
+	return filtered
+}
+
+func askConfirmationWithTimeout(prompt string, timeout time.Duration) bool {
+	fmt.Print(prompt)
+	ch := make(chan string, 1)
+	go func() {
+		var input string
+		_, err := fmt.Scanln(&input)
+		if err != nil {
+			ch <- ""
+			return
+		}
+		ch <- strings.TrimSpace(strings.ToLower(input))
+	}()
+
+	select {
+	case res := <-ch:
+		return res == "y" || res == "yes"
+	case <-time.After(timeout):
+		fmt.Println("\n⏰ 5秒超时无响应，默认跳过。")
+		return false
+	}
 }

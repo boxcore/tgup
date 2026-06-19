@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -142,6 +143,14 @@ func main() {
 		return
 	}
 
+	if !transcodeFlag && finalTestMode == "" {
+		files = filterUnsupportedVideos(files, config, cacheDir)
+		if len(files) == 0 {
+			fmt.Println("No files left to upload after filtering.")
+			return
+		}
+	}
+
 	if finalTestMode == "list" {
 		runs := buildRuns(files, config)
 		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个有效文件):\n", len(files))
@@ -159,7 +168,11 @@ func main() {
 				fmt.Println(strings.Repeat("-", 60))
 				continue
 			}
-			for _, chunk := range chunkBySizeAndCount(run.normalFiles, batchSizeFlag, maxGroupBytes) {
+			sizeThreshold := maxGroupBytes
+			if isLocalAPI(config.TgAPIURL) {
+				sizeThreshold = math.MaxInt64
+			}
+			for _, chunk := range chunkBySizeAndCount(run.normalFiles, batchSizeFlag, sizeThreshold) {
 				batchNo++
 				for _, file := range chunk {
 					globalIdx++
@@ -219,7 +232,11 @@ func main() {
 			}
 			continue
 		}
-		chunks := chunkBySizeAndCount(run.normalFiles, batchSizeFlag, maxGroupBytes)
+		sizeThreshold := maxGroupBytes
+		if isLocalAPI(config.TgAPIURL) {
+			sizeThreshold = math.MaxInt64
+		}
+		chunks := chunkBySizeAndCount(run.normalFiles, batchSizeFlag, sizeThreshold)
 		for i, chunk := range chunks {
 			fmt.Printf("\n--- Preparing batch: 第 %d/%d 批，共 %d 个文件，发起投递 ---\n", i+1, len(chunks), len(chunk))
 			preProcessAndUpload(bot, config, chunk, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
@@ -231,4 +248,9 @@ func main() {
 	if finalTestMode != "curl" {
 		fmt.Println("\nAll uploads completed successfully!")
 	}
+}
+
+func isLocalAPI(apiURL string) bool {
+	apiURL = strings.ToLower(strings.TrimSpace(apiURL))
+	return !strings.Contains(apiURL, "api.telegram.org")
 }
