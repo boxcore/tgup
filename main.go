@@ -84,6 +84,103 @@ type fileSortItem struct {
 	size    int64
 }
 
+// maxGroupBytes 是 Telegram sendMediaGroup 单次相册建议的总体积熔断阈值，
+// 同时也是判定"超限大视频需要走切片专属流程"的阈值。
+const maxGroupBytes int64 = 2000 * 1024 * 1024
+
+// runItem 表示按文件原始顺序切出的一段：
+// 要么是一组可以打包进同一个相册的普通文件（normalFiles），
+// 要么是一个需要走独立切片上传流程的超限大视频（largeVideoPath）。
+type runItem struct {
+	largeVideoPath string
+	normalFiles    []string
+}
+
+// buildRuns 按原始顺序扫描已过滤的文件列表，把连续的普通文件聚合成一段，
+// 遇到超限大视频则单独切出一段。预检（list 模式）和真实上传共用这一份逻辑，
+// 保证"预览看到的批次"和"实际发出去的批次"永远一致。
+func buildRuns(files []string, cfg *Config) []runItem {
+	var runs []runItem
+	var buf []string
+	flushBuf := func() {
+		if len(buf) > 0 {
+			runs = append(runs, runItem{normalFiles: buf})
+			buf = nil
+		}
+	}
+	for _, file := range files {
+		ext := strings.ToLower(filepath.Ext(file))
+		fi, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		isLargeVideo := contains(cfg.VideoExts, ext) && fi.Size() > maxGroupBytes
+		if isLargeVideo {
+			if !cfg.AllowSpilFile {
+				fmt.Printf("⚠️ 跳过大视频文件 (未激活切片开关 ALLOW_SPIL_FILE): %s (%s)\n", filepath.Base(file), formatSize(fi.Size()))
+				continue
+			}
+			if fi.Size() > cfg.AllowMaxSize {
+				fmt.Printf("❌ 超过最大文件尺寸限制 (ALLOW_MAX_SIZE: %s)，强制跳过: %s (%s)\n", formatSize(cfg.AllowMaxSize), filepath.Base(file), formatSize(fi.Size()))
+				continue
+			}
+			flushBuf()
+			runs = append(runs, runItem{largeVideoPath: file})
+		} else {
+			buf = append(buf, file)
+		}
+	}
+	flushBuf()
+	return runs
+}
+
+// chunkBySizeAndCount 把一段普通文件按 batchSize（同时也是 Telegram 相册单次上限 10）
+// 和总体积阈值切块。关键修复点：Telegram 的 sendMediaGroup 要求每次 2-10 个素材，
+// 如果按数量/体积切完后最后一批恰好只剩 1 个文件，这个请求会被 Telegram 直接拒绝，
+// 导致"实际发出去的上传次数"和预期不一致。这里在切块完成后做一次"借位"修正：
+// 如果最后一批只有 1 个文件，就从上一批末尾挪 1 个过来，凑成 2 个，避免孤儿批次。
+func chunkBySizeAndCount(files []string, batchSize int, sizeThreshold int64) [][]string {
+	var batches [][]string
+	var current []string
+	var currentSize int64
+
+	flush := func() {
+		if len(current) > 0 {
+			batches = append(batches, current)
+			current = nil
+			currentSize = 0
+		}
+	}
+
+	for _, file := range files {
+		var size int64
+		if fi, err := os.Stat(file); err == nil {
+			size = fi.Size()
+		}
+		if len(current) > 0 && currentSize+size > sizeThreshold {
+			flush()
+		}
+		current = append(current, file)
+		currentSize += size
+		if len(current) == batchSize {
+			flush()
+		}
+	}
+	flush()
+
+	if len(batches) >= 2 {
+		lastIdx := len(batches) - 1
+		if len(batches[lastIdx]) == 1 {
+			prevIdx := lastIdx - 1
+			prev := batches[prevIdx]
+			moved := prev[len(prev)-1]
+			batches[prevIdx] = prev[:len(prev)-1]
+			batches[lastIdx] = append([]string{moved}, batches[lastIdx]...)
+		}
+	}
+	return batches
+}
+
 func main() {
 	var flagArgs []string
 	var positionalArgs []string
@@ -196,43 +293,55 @@ func main() {
 	}
 
 	if finalTestMode == "list" {
-		totalBatches := (len(files) + batchSizeFlag - 1) / batchSizeFlag
-		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个，每批 %d 个，将分 %d 批循环执行):\n", len(files), batchSizeFlag, totalBatches)
+		runs := buildRuns(files, config)
+		fmt.Printf("\n📋 预检就绪：过滤与排序完成的文件列表 (共 %d 个有效文件):\n", len(files))
 		fmt.Println(strings.Repeat("-", 60))
-		for idx, file := range files {
-			fi, err := os.Stat(file)
-			sizeStr, cTimeStr, mTimeStr := "Unknown", "--", "--"
-			if err == nil {
-				sizeStr = formatSize(fi.Size())
-				mTime := fi.ModTime()
-				cTime := mTime
-				if sys := fi.Sys(); sys != nil {
-					v := reflect.ValueOf(sys).Elem()
-					statField := v.FieldByName("Ctim")
-					if !statField.IsValid() {
-						statField = v.FieldByName("Ctimespec")
-					}
-					if statField.IsValid() {
-						secField := statField.FieldByName("Sec")
-						nsecField := statField.FieldByName("Nsec")
-						if secField.IsValid() && nsecField.IsValid() {
-							cTime = time.Unix(secField.Int(), nsecField.Int())
-						}
-					}
+		globalIdx, batchNo := 0, 0
+		for _, run := range runs {
+			if run.largeVideoPath != "" {
+				fi, statErr := os.Stat(run.largeVideoPath)
+				sizeStr := "Unknown"
+				if statErr == nil {
+					sizeStr = formatSize(fi.Size())
 				}
-				cTimeStr, mTimeStr = cTime.Format("2006-01-02 15:04"), mTime.Format("2006-01-02 15:04")
+				globalIdx++
+				fmt.Printf("[%03d] %s (%s) — 🎬 超限大视频，运行时自动切片后单独分批投递（具体切片数取决于时长，此处不预估）\n", globalIdx, filepath.Base(run.largeVideoPath), sizeStr)
+				fmt.Println(strings.Repeat("-", 60))
+				continue
 			}
-			fmt.Printf("[%03d] %s (%s | C:%s M:%s)\n", idx+1, filepath.Base(file), sizeStr, cTimeStr, mTimeStr)
-			if (idx+1)%batchSizeFlag == 0 || (idx+1) == len(files) {
-				currentBatch := (idx / batchSizeFlag) + 1
-				itemsInBatch := batchSizeFlag
-				if (idx+1) == len(files) && len(files)%batchSizeFlag != 0 {
-					itemsInBatch = len(files) % batchSizeFlag
+			for _, chunk := range chunkBySizeAndCount(run.normalFiles, batchSizeFlag, maxGroupBytes) {
+				batchNo++
+				for _, file := range chunk {
+					globalIdx++
+					fi, err := os.Stat(file)
+					sizeStr, cTimeStr, mTimeStr := "Unknown", "--", "--"
+					if err == nil {
+						sizeStr = formatSize(fi.Size())
+						mTime := fi.ModTime()
+						cTime := mTime
+						if sys := fi.Sys(); sys != nil {
+							v := reflect.ValueOf(sys).Elem()
+							statField := v.FieldByName("Ctim")
+							if !statField.IsValid() {
+								statField = v.FieldByName("Ctimespec")
+							}
+							if statField.IsValid() {
+								secField := statField.FieldByName("Sec")
+								nsecField := statField.FieldByName("Nsec")
+								if secField.IsValid() && nsecField.IsValid() {
+									cTime = time.Unix(secField.Int(), nsecField.Int())
+								}
+							}
+						}
+						cTimeStr, mTimeStr = cTime.Format("2006-01-02 15:04"), mTime.Format("2006-01-02 15:04")
+					}
+					fmt.Printf("[%03d] %s (%s | C:%s M:%s)\n", globalIdx, filepath.Base(file), sizeStr, cTimeStr, mTimeStr)
 				}
-				fmt.Printf("📦 👆 以上为 [第 %d / %d 批次] 预检包 (包含 %d 个文件) 👆\n", currentBatch, totalBatches, itemsInBatch)
+				fmt.Printf("📦 👆 以上为 [第 %d 批] 普通相册预检包 (包含 %d 个文件) 👆\n", batchNo, len(chunk))
 				fmt.Println(strings.Repeat("-", 60))
 			}
 		}
+		fmt.Printf("✅ 预计产生 %d 个普通相册批次（大视频切片产生的额外批次数运行时才能确定，不含在内）\n", batchNo)
 		return
 	}
 
@@ -251,66 +360,23 @@ func main() {
 		}
 	}
 
-	var currentBatch []string
-	var currentBatchSize int64 = 0
-
-	for _, file := range files {
-		ext := strings.ToLower(filepath.Ext(file))
-		fi, err := os.Stat(file)
-		if err != nil {
-			continue
-		}
-
-		isLargeVideo := contains(config.VideoExts, ext) && fi.Size() > 2000*1024*1024
-
-		if isLargeVideo {
-			if !config.AllowSpilFile {
-				fmt.Printf("⚠️ 跳过大视频文件 (未激活切片开关 ALLOW_SPIL_FILE): %s (%s)\n", filepath.Base(file), formatSize(fi.Size()))
-				continue
-			}
-			if fi.Size() > config.AllowMaxSize {
-				fmt.Printf("❌ 超过最大文件尺寸限制 (ALLOW_MAX_SIZE: %s)，强制跳过: %s (%s)\n", formatSize(config.AllowMaxSize), filepath.Base(file), formatSize(fi.Size()))
-				continue
-			}
-			if len(currentBatch) > 0 {
-				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
-				currentBatch = nil
-				currentBatchSize = 0
-				if sleepDurationFlag > 0 {
-					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
-				}
-			}
-			handleSplitVideoUpload(bot, config, file, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode, batchSizeFlag, sleepDurationFlag)
+	runs := buildRuns(files, config)
+	for _, run := range runs {
+		if run.largeVideoPath != "" {
+			handleSplitVideoUpload(bot, config, run.largeVideoPath, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode, batchSizeFlag, sleepDurationFlag)
 			if sleepDurationFlag > 0 {
 				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
-		} else {
-			if len(currentBatch) > 0 && (currentBatchSize+fi.Size()) > 2000*1024*1024 {
-				fmt.Printf("\n📦 [容量熔断保护] 当前群组总体积将超过 2GB 阈值，前置强行投递已积攒的 %d 个文件...\n", len(currentBatch))
-				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
-				currentBatch = nil
-				currentBatchSize = 0
-				if sleepDurationFlag > 0 {
-					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
-				}
-			}
-
-			currentBatch = append(currentBatch, file)
-			currentBatchSize += fi.Size()
-
-			if len(currentBatch) == batchSizeFlag {
-				fmt.Printf("\n--- Preparing batch: 满 %d 个多媒体包，发起正常投递 ---\n", batchSizeFlag)
-				preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
-				currentBatch = nil
-				currentBatchSize = 0
-				if sleepDurationFlag > 0 {
-					time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
-				}
+			continue
+		}
+		chunks := chunkBySizeAndCount(run.normalFiles, batchSizeFlag, maxGroupBytes)
+		for i, chunk := range chunks {
+			fmt.Printf("\n--- Preparing batch: 第 %d/%d 批，共 %d 个文件，发起投递 ---\n", i+1, len(chunks), len(chunk))
+			preProcessAndUpload(bot, config, chunk, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+			if sleepDurationFlag > 0 {
+				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
 		}
-	}
-	if len(currentBatch) > 0 {
-		preProcessAndUpload(bot, config, currentBatch, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
 	}
 	if finalTestMode != "curl" {
 		fmt.Println("\nAll uploads completed successfully!")
@@ -421,17 +487,14 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 	sort.Slice(splitPieces, func(i, j int) bool { return isLessNatural(splitPieces[i], splitPieces[j]) })
 	fmt.Printf("📦 切片大功告成！裂变生成 %d 个分段小视频，开始进入分批画廊队列...\n", len(splitPieces))
 
-	for k := 0; k < len(splitPieces); k += batchSize {
-		endK := k + batchSize
-		if endK > len(splitPieces) {
-			endK = len(splitPieces)
-		}
-		pieceBatch := splitPieces[k:endK]
-
-		fmt.Printf("🎬 正在投递大视频切片子集专辑 (%d-%d / 总数 %d)...\n", k+1, endK, len(splitPieces))
+	chunks := chunkBySizeAndCount(splitPieces, batchSize, math.MaxInt64)
+	processed := 0
+	for ci, pieceBatch := range chunks {
+		fmt.Printf("🎬 正在投递大视频切片子集专辑 (%d-%d / 总数 %d)...\n", processed+1, processed+len(pieceBatch), len(splitPieces))
 		preProcessAndUpload(bot, cfg, pieceBatch, cacheDir, cacheForce, globalCaption, logDir, transcodeFlag, finalTestMode)
+		processed += len(pieceBatch)
 
-		if endK < len(splitPieces) && sleepDuration > 0 {
+		if ci < len(chunks)-1 && sleepDuration > 0 {
 			time.Sleep(time.Duration(sleepDuration) * time.Second)
 		}
 	}
