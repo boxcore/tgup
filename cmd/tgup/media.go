@@ -433,7 +433,7 @@ func filterUnsupportedVideos(files []string, config *Config, cacheDir string) []
 
 		fmt.Println(strings.Repeat("=", 60))
 		fmt.Printf("⚠️ 警告: 视频文件 [%s] (编码: %s) 在 Telegram 上不支持媒体流直接点播！\n", filepath.Base(file), codec)
-		fmt.Println("提示: 建议使用 --transcode 参数进行实时转码，或提前转换为 H.264 MP4 格式。")
+		fmt.Println("提示: 建议提前将该视频转换为 H.264 MP4 格式后再行上传。")
 
 		prompt := fmt.Sprintf("❓ 是否坚持直接上传该文件？(y/n, 5秒内无输入默认跳过): ")
 		confirmed := askConfirmationWithTimeout(prompt, 5*time.Second)

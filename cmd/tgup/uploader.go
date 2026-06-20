@@ -26,7 +26,6 @@ type FilePayload struct {
 	FieldKey      string `json:"field_key"`
 	FilePath      string `json:"file_path"`
 	ShowProgress  bool   `json:"show_progress"`
-	NeedTranscode bool   `json:"need_transcode"`
 }
 
 // TgMediaItem 🟢 彻底修复：严格独立分行，绝不混用 Tag 占位
@@ -41,7 +40,7 @@ type TgMediaItem struct {
 	Thumb             string `json:"thumb,omitempty"`
 }
 
-func preProcessAndUpload(bot *tgbotapi.BotAPI, config *Config, batch []string, cacheDir string, cacheForceFlag bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string) {
+func preProcessAndUpload(bot *tgbotapi.BotAPI, config *Config, batch []string, cacheDir string, cacheForceFlag bool, globalCaption string, logDir string, finalTestMode string) {
 	if finalTestMode != "curl" {
 		for _, f := range batch {
 			if contains(config.VideoExts, strings.ToLower(filepath.Ext(f))) {
@@ -53,11 +52,11 @@ func preProcessAndUpload(bot *tgbotapi.BotAPI, config *Config, batch []string, c
 	if finalTestMode == "curl" {
 		generateCurlCommand(config, batch, globalCaption, cacheDir, cacheForceFlag)
 	} else {
-		uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag, transcodeFlag)
+		uploadMediaGroup(bot, config.ChatID, batch, cacheDir, globalCaption, config, logDir, cacheForceFlag)
 	}
 }
 
-func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, cacheDir string, cacheForce bool, globalCaption string, logDir string, transcodeFlag bool, finalTestMode string, batchSize int, sleepDuration int) {
+func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, cacheDir string, cacheForce bool, globalCaption string, logDir string, finalTestMode string, batchSize int, sleepDuration int) {
 	ext := strings.ToLower(filepath.Ext(origPath))
 	baseName := filepath.Base(origPath)
 	fi, err := os.Stat(origPath)
@@ -149,7 +148,7 @@ func handleSplitVideoUpload(bot *tgbotapi.BotAPI, cfg *Config, origPath string, 
 	processed := 0
 	for ci, pieceBatch := range chunks {
 		fmt.Printf("🎬 正在投递大视频切片子集专辑 (%d-%d / 总数 %d)...\n", processed+1, processed+len(pieceBatch), len(splitPieces))
-		preProcessAndUpload(bot, cfg, pieceBatch, cacheDir, cacheForce, globalCaption, logDir, transcodeFlag, finalTestMode)
+		preProcessAndUpload(bot, cfg, pieceBatch, cacheDir, cacheForce, globalCaption, logDir, finalTestMode)
 		processed += len(pieceBatch)
 
 		if ci < len(chunks)-1 && sleepDuration > 0 {
@@ -224,7 +223,11 @@ func generateCurlCommand(cfg *Config, files []string, globalCaption string, cach
 	fmt.Printf("curl -X POST \"%s/bot%s/sendMediaGroup\" \\\n     -F \"chat_id=%d\" \\\n     -F \"media=%s\" \\\n%s\n", cfg.TgAPIURL, cfg.BotAPI, cfg.ChatID, strings.ReplaceAll(string(mediaBytes), `"`, `\"`), strings.Join(fileFormFields, " \\\n"))
 }
 
-func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool, transcodeFlag bool) {
+func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheDir string, globalCaption string, cfg *Config, logDir string, cacheForce bool) {
+	if cfg.RateLimit > 0 {
+		waitRateLimit(cfg.RateLimit)
+	}
+
 	var mediaJSONArray []TgMediaItem
 	var payloads []FilePayload
 	isFirstItem := true
@@ -246,24 +249,24 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 			if thumbPath != "" {
 				thumbFormKey := fmt.Sprintf("thumb_video%d", videoIdx)
 				thumbValue = "attach://" + thumbFormKey
-				payloads = append(payloads, FilePayload{FieldKey: thumbFormKey, FilePath: thumbPath, ShowProgress: false, NeedTranscode: false})
+				payloads = append(payloads, FilePayload{FieldKey: thumbFormKey, FilePath: thumbPath, ShowProgress: false})
 			}
 			if isPortraitVideo && width > height {
 				width, height = height, width
 			}
 			mediaJSONArray = append(mediaJSONArray, TgMediaItem{Type: "video", Media: "attach://" + attachKey, Caption: currentCaption, Width: width, Height: height, Duration: duration, SupportsStreaming: true, Thumb: thumbValue})
-			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: file, ShowProgress: true, NeedTranscode: transcodeFlag})
+			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: file, ShowProgress: true})
 			videoIdx++
 		} else if isPhoto {
 			attachKey := fmt.Sprintf("photo%d", photoIdx)
 			finalPhotoPath, _ := checkAndResizePhoto(file, cacheDir, cacheForce)
 			mediaJSONArray = append(mediaJSONArray, TgMediaItem{Type: "photo", Media: "attach://" + attachKey, Caption: currentCaption})
-			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: finalPhotoPath, ShowProgress: true, NeedTranscode: false})
+			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: finalPhotoPath, ShowProgress: true})
 			photoIdx++
 		} else {
 			attachKey := fmt.Sprintf("doc%d", docIdx)
 			mediaJSONArray = append(mediaJSONArray, TgMediaItem{Type: "document", Media: "attach://" + attachKey, Caption: currentCaption})
-			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: file, ShowProgress: true, NeedTranscode: false})
+			payloads = append(payloads, FilePayload{FieldKey: attachKey, FilePath: file, ShowProgress: true})
 			docIdx++
 		}
 	}
@@ -283,46 +286,29 @@ func uploadMediaGroup(bot *tgbotapi.BotAPI, chatID int64, files []string, cacheD
 
 			for _, p := range payloads {
 				uploadFileName := filepath.Base(p.FilePath)
-				if p.NeedTranscode {
-					uploadFileName = strings.TrimSuffix(uploadFileName, filepath.Ext(uploadFileName)) + ".mp4"
-				}
 				part, err := multipartWriter.CreateFormFile(p.FieldKey, uploadFileName)
 				if err != nil {
 					return
 				}
 
-				if p.NeedTranscode {
-					cmd := exec.Command("ffmpeg", "-y", "-threads", "2", "-i", p.FilePath, "-c:v", "libx264", "-preset", "veryfast", "-vf", "scale='if(gt(iw,ih),-2,720)':'if(gt(iw,ih),720,-2)'", "-pix_fmt", "yuv420p", "-profile:v", "main", "-level:v", "4.0", "-c:a", "aac", "-b:a", "128k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "pipe:1")
-					cmd.Stdout = part
-					var bar *progressbar.ProgressBar
-					if p.ShowProgress {
-						bar = progressbar.NewOptions(-1, progressbar.OptionSetDescription(fmt.Sprintf("[⚙️转码上传] %s", filepath.Base(p.FilePath))), progressbar.OptionSetWriter(os.Stderr), progressbar.OptionShowBytes(true), progressbar.OptionSetWidth(15), progressbar.OptionThrottle(65), progressbar.OptionSpinnerType(14), progressbar.OptionFullWidth())
-						cmd.Stdout = io.MultiWriter(part, bar)
-					}
-					_ = cmd.Run()
-					if bar != nil {
-						fmt.Fprint(os.Stderr, "\n")
-					}
-				} else {
-					file, err := os.Open(p.FilePath)
-					if err != nil {
-						return
-					}
-					if p.ShowProgress {
-						fi, _ := file.Stat()
-						descStr := filepath.Base(p.FilePath)
-						if retry > 0 {
-							descStr = fmt.Sprintf("[重试-%d] %s", retry, descStr)
-						}
-						bar := progressbar.NewOptions64(fi.Size(), progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", descStr)), progressbar.OptionSetWriter(os.Stderr), progressbar.OptionShowBytes(true), progressbar.OptionSetWidth(15), progressbar.OptionThrottle(65), progressbar.OptionShowCount(), progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }), progressbar.OptionSpinnerType(14), progressbar.OptionFullWidth())
-
-						proxyReader := progressbar.NewReader(file, bar)
-						_, _ = io.Copy(part, &proxyReader)
-					} else {
-						_, _ = io.Copy(part, file)
-					}
-					file.Close()
+				file, err := os.Open(p.FilePath)
+				if err != nil {
+					return
 				}
+				if p.ShowProgress {
+					fi, _ := file.Stat()
+					descStr := filepath.Base(p.FilePath)
+					if retry > 0 {
+						descStr = fmt.Sprintf("[重试-%d] %s", retry, descStr)
+					}
+					bar := progressbar.NewOptions64(fi.Size(), progressbar.OptionSetDescription(fmt.Sprintf("[Uploading] %s", descStr)), progressbar.OptionSetWriter(os.Stderr), progressbar.OptionShowBytes(true), progressbar.OptionSetWidth(15), progressbar.OptionThrottle(65), progressbar.OptionShowCount(), progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }), progressbar.OptionSpinnerType(14), progressbar.OptionFullWidth())
+
+					proxyReader := progressbar.NewReader(file, bar)
+					_, _ = io.Copy(part, &proxyReader)
+				} else {
+					_, _ = io.Copy(part, file)
+				}
+				file.Close()
 			}
 		}()
 
@@ -385,3 +371,34 @@ func writeLog(logDir string, filename string, content string) {
 	defer f.Close()
 	_, _ = f.WriteString(content)
 }
+
+var requestTimestamps []time.Time
+
+func waitRateLimit(limit int) {
+	for {
+		now := time.Now()
+		cutoff := now.Add(-60 * time.Second)
+
+		valid := 0
+		for _, t := range requestTimestamps {
+			if t.After(cutoff) {
+				requestTimestamps[valid] = t
+				valid++
+			}
+		}
+		requestTimestamps = requestTimestamps[:valid]
+
+		if len(requestTimestamps) < limit {
+			break
+		}
+
+		oldest := requestTimestamps[0]
+		waitDuration := oldest.Add(60 * time.Second).Sub(now)
+		if waitDuration > 0 {
+			fmt.Printf("\n⏳ 触发群组发包限频控制（每分钟最多 %d 个请求）。自主休眠等待 %.1f 秒...\n", limit, waitDuration.Seconds())
+			time.Sleep(waitDuration)
+		}
+	}
+	requestTimestamps = append(requestTimestamps, time.Now())
+}
+

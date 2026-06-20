@@ -23,7 +23,7 @@ func main() {
 			flagArgs = append(flagArgs, arg)
 			if !strings.Contains(arg, "=") {
 				fName := strings.TrimLeft(arg, "-")
-				if fName == "title" || fName == "t" || fName == "test" || fName == "type" || fName == "n" || fName == "s" || fName == "sort" || fName == "spil" {
+				if fName == "title" || fName == "t" || fName == "test" || fName == "type" || fName == "n" || fName == "s" || fName == "sort" || fName == "spil" || fName == "r" || fName == "rate-limit" {
 					if i+1 < len(os.Args) {
 						flagArgs = append(flagArgs, os.Args[i+1])
 						i++
@@ -37,8 +37,8 @@ func main() {
 	os.Args = append(append([]string{os.Args[0]}, flagArgs...), positionalArgs...)
 
 	var titleFlag, testFlag, typeFilterFlag, sortFlag string
-	var cacheForceFlag, transcodeFlag, spilFlag, checkVedioFlag bool
-	var batchSizeFlag, sleepDurationFlag int
+	var cacheForceFlag, spilFlag, checkVedioFlag, versionFlag bool
+	var batchSizeFlag, sleepDurationFlag, rateLimitFlag int
 
 	flag.StringVar(&titleFlag, "title", "", "Global title")
 	flag.StringVar(&testFlag, "t", "", "Test mode")
@@ -48,12 +48,20 @@ func main() {
 	flag.IntVar(&batchSizeFlag, "n", 10, "Batch size")
 	flag.StringVar(&typeFilterFlag, "type", "all", "Type filter")
 	flag.IntVar(&sleepDurationFlag, "s", 4, "Sleep duration")
-	flag.BoolVar(&transcodeFlag, "transcode", false, "Enable transcode")
 	flag.StringVar(&sortFlag, "sort", "name", "Sort strategy")
 	flag.BoolVar(&spilFlag, "spil", false, "Force split")
 	flag.BoolVar(&checkVedioFlag, "check-vedio", false, "Check video files info")
 	flag.BoolVar(&checkVedioFlag, "check-video", false, "Check video files info (alias)")
+	flag.IntVar(&rateLimitFlag, "rate-limit", -1, "Max messages per minute")
+	flag.IntVar(&rateLimitFlag, "r", -1, "Max messages per minute (short)")
+	flag.BoolVar(&versionFlag, "version", false, "Show version info")
+	flag.BoolVar(&versionFlag, "v", false, "Show version info (alias)")
 	flag.Parse()
+
+	if versionFlag {
+		fmt.Println("v0.1")
+		os.Exit(0)
+	}
 
 	tailArgs := flag.Args()
 	if len(tailArgs) == 0 {
@@ -88,6 +96,9 @@ func main() {
 	}
 	if spilFlag {
 		config.AllowSpilFile = true
+	}
+	if rateLimitFlag != -1 {
+		config.RateLimit = rateLimitFlag
 	}
 
 	rawFiles, err := collectFiles(targetPath, sortFlag)
@@ -143,7 +154,7 @@ func main() {
 		return
 	}
 
-	if !transcodeFlag && finalTestMode == "" {
+	if finalTestMode == "" {
 		files = filterUnsupportedVideos(files, config, cacheDir)
 		if len(files) == 0 {
 			fmt.Println("No files left to upload after filtering.")
@@ -168,11 +179,7 @@ func main() {
 				fmt.Println(strings.Repeat("-", 60))
 				continue
 			}
-			sizeThreshold := maxGroupBytes
-			if isLocalAPI(config.TgAPIURL) {
-				sizeThreshold = math.MaxInt64
-			}
-			for _, chunk := range chunkBySizeAndCount(run.normalFiles, batchSizeFlag, sizeThreshold) {
+			for _, chunk := range chunkBySizeAndCount(run.normalFiles, batchSizeFlag, math.MaxInt64) {
 				batchNo++
 				for _, file := range chunk {
 					globalIdx++
@@ -226,20 +233,16 @@ func main() {
 	runs := buildRuns(files, config)
 	for _, run := range runs {
 		if run.largeVideoPath != "" {
-			handleSplitVideoUpload(bot, config, run.largeVideoPath, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode, batchSizeFlag, sleepDurationFlag)
+			handleSplitVideoUpload(bot, config, run.largeVideoPath, cacheDir, cacheForceFlag, globalCaption, logDir, finalTestMode, batchSizeFlag, sleepDurationFlag)
 			if sleepDurationFlag > 0 {
 				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
 			continue
 		}
-		sizeThreshold := maxGroupBytes
-		if isLocalAPI(config.TgAPIURL) {
-			sizeThreshold = math.MaxInt64
-		}
-		chunks := chunkBySizeAndCount(run.normalFiles, batchSizeFlag, sizeThreshold)
+		chunks := chunkBySizeAndCount(run.normalFiles, batchSizeFlag, math.MaxInt64)
 		for i, chunk := range chunks {
 			fmt.Printf("\n--- Preparing batch: 第 %d/%d 批，共 %d 个文件，发起投递 ---\n", i+1, len(chunks), len(chunk))
-			preProcessAndUpload(bot, config, chunk, cacheDir, cacheForceFlag, globalCaption, logDir, transcodeFlag, finalTestMode)
+			preProcessAndUpload(bot, config, chunk, cacheDir, cacheForceFlag, globalCaption, logDir, finalTestMode)
 			if sleepDurationFlag > 0 {
 				time.Sleep(time.Duration(sleepDurationFlag) * time.Second)
 			}
@@ -250,7 +253,3 @@ func main() {
 	}
 }
 
-func isLocalAPI(apiURL string) bool {
-	apiURL = strings.ToLower(strings.TrimSpace(apiURL))
-	return !strings.Contains(apiURL, "api.telegram.org")
-}

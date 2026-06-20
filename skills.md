@@ -52,9 +52,10 @@ sudo mv tgup /usr/local/bin/
 <br>• `curl`: 实时生成带有本地图片自适应缩放器的标准 Multipart `curl` POST 调试命令。 |
 | `-n` | — | `10` | `1 ~ 10` | **画廊专辑单批最大合并数**。由于 Telegram 限制，一个相册最高容纳 10 个媒体。 |
 | `-s` | — | `4` | `秒数` | **批次间战略冷却冷却时延**。发完一整批后主动休眠，防止撞墙 Telegram 官方风控。 |
+| `--rate-limit` | `-r` | `20` | `个` | **群组发包限频控制**。Bot 每分钟发消息不超过此数量（防止触发 Telegram 官方群组 20 msg/min 的风控限频规则）。 |
 | `--spil` | — | `false` | `true` / `false` | **强制激活大视频切片核心**。无需更改配置文件，直接在命令行开启 >2GB 视频流拷贝秒切投递功能。 |
-| `--transcode` | — | `false` | `true` / `false` | **极速转码内核**。针对非标准格式视频进行 2核 CPU 物理约束下的等比 720p 降维打击转码。 |
 | `--type` | — | `all` | `all` / `pic` / `video` / `m4v` | **后缀大类或具体格式过滤器**。只扫描或上传符合条件的特定后缀文件。 |
+| `-v` / `--version` | `-v` | `false` | `true` / `false` | **显示版本信息**。输出当前可执行文件的版本号并退出。 |
 
 ---
 
@@ -65,6 +66,7 @@ sudo mv tgup /usr/local/bin/
 CHAT_ID=-100xxxxxxxxxx
 BOT_API=1234567890:ABCdefGhIJKlmNoPQRsTUVwXyZ
 TG_API_URL=http://127.0.0.1:8081
+RATE_LIMIT=20
 
 # 多媒体扫描后缀规则
 PHOTO_EXTS=jpg,jpeg,png
@@ -109,7 +111,6 @@ tgup -n=7 -t=list --sort=create /path/to/webdav/dir
 # 2. 强攻大视频：强制激活大视频切片逻辑，将文件大小倒序（从最大视频开始上传），且设定批次冷却 20 秒
 tgup -n=10 -s=20 --spil --sort=size_desc /path/to/webdav/dir
 
-# 3. 混合控流生产：仅过滤转码小体积的 m4v 视频，预处理完成后正式投递并附带全局标题
-tgup -type=m4v --transcode --sort=size --title='推特反差女神姬美2026最新合流 #推特 #反差' /path/to/dir
-
+# 3. 混合控流生产：仅过滤出 m4v 格式的视频，且按文件大小升序，预处理完成后正式投递并附带全局标题
+tgup -type=m4v --sort=size --title='推特反差女神姬美2026最新合流 #推特 #反差' /path/to/dir
 ```

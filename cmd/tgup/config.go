@@ -16,6 +16,7 @@ type Config struct {
 	AllowSpilFile bool     `json:"allow_spil_file"`
 	AllowMaxSize  int64    `json:"allow_max_size"`
 	SpilMaxSize   float64  `json:"spil_max_size"`
+	RateLimit     int      `json:"rate_limit"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -24,7 +25,14 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	defer file.Close()
-	cfg := &Config{PhotoExts: []string{".jpg", ".jpeg", ".png"}, VideoExts: []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"}, AllowSpilFile: false, AllowMaxSize: 10 * 1024 * 1024 * 1024, SpilMaxSize: 1.5}
+	cfg := &Config{
+		PhotoExts:     []string{".jpg", ".jpeg", ".png"},
+		VideoExts:     []string{".mp4", ".mkv", ".avi", ".mov", ".m4v"},
+		AllowSpilFile: false,
+		AllowMaxSize:  10 * 1024 * 1024 * 1024,
+		SpilMaxSize:   1.5,
+		RateLimit:     20,
+	}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -45,6 +53,9 @@ func loadConfig(path string) (*Config, error) {
 			cfg.BotAPI = val
 		case "TG_API_URL":
 			cfg.TgAPIURL = val
+		case "RATE_LIMIT":
+			limit, _ := strconv.Atoi(val)
+			cfg.RateLimit = limit
 		case "ALLOW_SPIL_FILE":
 			cfg.AllowSpilFile = strings.ToLower(val) == "true"
 		case "ALLOW_MAX_SIZE":
